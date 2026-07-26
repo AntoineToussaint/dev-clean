@@ -232,7 +232,7 @@ if [ ! -f "$CFG" ] && [ "$YES" -ne 1 ] && [ -e /dev/tty ]; then
             "$DEST" --init < /dev/tty
             ;;
         *)
-            say "  ${D}skipped. run [bold]rust-clean --init[/] later to configure.${R}"
+            say "  ${D}skipped. run ${B}rust-clean --init${R}${D} later to configure.${R}"
             ;;
     esac
 fi
