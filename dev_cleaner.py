@@ -246,7 +246,7 @@ def render_config(roots: list[str], days: float, ignore: list[str] | None = None
     ignore = ignore or []
     skip = skip or []
     return f"""\
-# dev-cleaner config — https://github.com/AntoineToussaint/dev-cleaner
+# dev-cleaner config — https://github.com/AntoineToussaint/dev-clean
 # CLI flags override anything set here.
 
 # Directories to scan for projects (supports ~ expansion).

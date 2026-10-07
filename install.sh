@@ -26,8 +26,8 @@ for arg in "$@"; do
 done
 
 NAME="dev-cleaner"
-REPO="https://github.com/AntoineToussaint/dev-cleaner"
-REMOTE_URL="https://raw.githubusercontent.com/AntoineToussaint/dev-cleaner/main/dev_cleaner.py"
+REPO="https://github.com/AntoineToussaint/dev-clean"
+REMOTE_URL="https://raw.githubusercontent.com/AntoineToussaint/dev-clean/main/dev_cleaner.py"
 
 # Helper: append lines to an rc file, idempotently and with a marker comment.
 # Args: $1 = rc path, $2 = grep-test string (skip if found), $3+ = lines to append

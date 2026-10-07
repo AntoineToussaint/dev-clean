@@ -51,13 +51,13 @@ dry-run — no changes made.
 **One-liner** (macOS + Linux):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AntoineToussaint/dev-cleaner/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/AntoineToussaint/dev-clean/main/install.sh | bash
 ```
 
 **Or clone:**
 
 ```bash
-git clone https://github.com/AntoineToussaint/dev-cleaner.git
+git clone https://github.com/AntoineToussaint/dev-clean.git
 cd dev-cleaner
 ./install.sh
 ```
