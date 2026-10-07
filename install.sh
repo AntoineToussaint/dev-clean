@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Installs `rust-clean` to ~/.local/bin. Works on macOS and Linux.
-# Usage: ./install.sh [--dev] [--yes]
-#   --dev   symlink instead of copy (edits to source propagate)
-#   --yes   non-interactive: auto-install uv if missing
+# Installs `dev-cleaner` to ~/.local/bin. Works on macOS and Linux.
+# Usage: ./install.sh [--dev] [--yes] [--no-completions] [--no-rc-edit]
+#   --dev             symlink instead of copy (edits to source propagate)
+#   --yes             non-interactive: auto-install uv if missing, auto-edit shell rc
+#   --no-completions  skip shell completions
+#   --no-rc-edit      print the completion rc lines instead of appending them
 
 set -euo pipefail
 
@@ -17,11 +19,15 @@ for arg in "$@"; do
         --no-completions) COMPLETIONS=0 ;;
         --no-rc-edit) RC_EDIT=0 ;;
         -h|--help)
-            sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'
             exit 0 ;;
         *) echo "unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
+
+NAME="dev-cleaner"
+REPO="https://github.com/AntoineToussaint/dev-cleaner"
+REMOTE_URL="https://raw.githubusercontent.com/AntoineToussaint/dev-cleaner/main/dev_cleaner.py"
 
 # Helper: append lines to an rc file, idempotently and with a marker comment.
 # Args: $1 = rc path, $2 = grep-test string (skip if found), $3+ = lines to append
@@ -32,7 +38,7 @@ rc_append() {
         return 1  # already present
     fi
     {
-        printf '\n# Added by rust-clean installer (https://github.com/AntoineToussaint/rust-clean)\n'
+        printf '\n# Added by %s installer (%s)\n' "$NAME" "$REPO"
         printf '%s\n' "$@"
     } >> "$rc"
     return 0
@@ -63,14 +69,13 @@ warn() { printf '  %s!%s %s\n' "$YEL" "$R" "$*"; }
 err()  { printf '  %s✗%s %s\n' "$RED" "$R" "$*" >&2; }
 
 say ""
-say "${MAG}${B}🦀  rust-clean installer${R}"
-say "${D}    cross-platform installer for the rust target cleaner${R}"
+say "${MAG}${B}🧹  ${NAME} installer${R}"
+say "${D}    sweep stale build dirs & dev caches${R}"
 say ""
 
 # Locate source script: next to this installer (git clone) or fetch from GitHub (curl|bash)
-REMOTE_URL="https://raw.githubusercontent.com/AntoineToussaint/rust-clean/main/clean_rust_targets.py"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo "")"
-LOCAL_SRC="$HERE/clean_rust_targets.py"
+LOCAL_SRC="$HERE/dev_cleaner.py"
 TMP_SRC=""
 
 if [ -n "$HERE" ] && [ -f "$LOCAL_SRC" ]; then
@@ -81,7 +86,7 @@ else
         err "--dev requires running install.sh from the cloned repo"
         exit 1
     fi
-    TMP_SRC="$(mktemp -t rust-clean.XXXXXX.py)"
+    TMP_SRC="$(mktemp -t dev-cleaner.XXXXXX.py)"
     trap 'rm -f "$TMP_SRC"' EXIT
     if ! curl -fsSL "$REMOTE_URL" -o "$TMP_SRC"; then
         err "failed to fetch script from $REMOTE_URL"
@@ -94,41 +99,25 @@ fi
 # Detect uv
 if ! command -v uv >/dev/null 2>&1; then
     warn "uv not found"
-    if [ "$YES" -eq 1 ]; then
-        REPLY="y"
+    if ask_yes "install uv via the official installer?"; then
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        # Pick up uv on PATH for the rest of this script
+        export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+        command -v uv >/dev/null || { err "uv install failed"; exit 1; }
+        ok "uv installed"
     else
-        printf "  install uv via the official installer? [Y/n] "
-        read -r REPLY < /dev/tty || REPLY="n"
+        err "uv is required. install from https://docs.astral.sh/uv/ and re-run."
+        exit 1
     fi
-    case "${REPLY:-y}" in
-        y|Y|yes|"")
-            curl -LsSf https://astral.sh/uv/install.sh | sh
-            # Pick up uv on PATH for the rest of this script
-            export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-            command -v uv >/dev/null || { err "uv install failed"; exit 1; }
-            ok "uv installed"
-            ;;
-        *)
-            err "uv is required. install from https://docs.astral.sh/uv/ and re-run."
-            exit 1 ;;
-    esac
 else
     ok "uv found: $(command -v uv)"
 fi
 
-# Detect cargo (warn only)
-if command -v cargo >/dev/null 2>&1; then
-    ok "cargo found: $(command -v cargo)"
-else
-    warn "cargo not found — install Rust from https://rustup.rs to actually clean"
-fi
-
 # Install destination
 DEST_DIR="$HOME/.local/bin"
-DEST="$DEST_DIR/rust-clean"
+DEST="$DEST_DIR/$NAME"
 mkdir -p "$DEST_DIR"
 
-# Remove old entry if present
 if [ -e "$DEST" ] || [ -L "$DEST" ]; then
     rm -f "$DEST"
 fi
@@ -140,6 +129,21 @@ else
     cp "$SRC" "$DEST"
     chmod +x "$DEST"
     ok "installed $DEST"
+fi
+
+# Migrate from rust-clean (the previous name of this tool)
+OLD_BIN="$DEST_DIR/rust-clean"
+if [ -e "$OLD_BIN" ] || [ -L "$OLD_BIN" ]; then
+    rm -f "$OLD_BIN" \
+          "${ZDOTDIR:-$HOME}/.zsh/completions/_rust-clean" \
+          "$HOME/.local/share/rust-clean/completion.bash" \
+          "$HOME/.config/fish/completions/rust-clean.fish" 2>/dev/null || true
+    ok "removed legacy rust-clean binary + completions"
+fi
+OLD_CFG="${XDG_CONFIG_HOME:-$HOME/.config}/rust-clean/config.toml"
+NEW_CFG="${XDG_CONFIG_HOME:-$HOME/.config}/$NAME/config.toml"
+if [ -f "$OLD_CFG" ] && [ ! -f "$NEW_CFG" ]; then
+    warn "found legacy config $OLD_CFG — $NAME reads it until you run ${B}$NAME --init${R}"
 fi
 
 # PATH check
@@ -167,61 +171,51 @@ if [ "$COMPLETIONS" -eq 1 ]; then
         */zsh)
             ZSH_DIR="${ZDOTDIR:-$HOME}/.zsh/completions"
             mkdir -p "$ZSH_DIR"
-            "$DEST" --completion zsh > "$ZSH_DIR/_rust-clean"
-            ok "zsh completion → $ZSH_DIR/_rust-clean"
+            "$DEST" --completion zsh > "$ZSH_DIR/_$NAME"
+            ok "zsh completions → $ZSH_DIR/_$NAME"
             ZRC="${ZDOTDIR:-$HOME}/.zshrc"
-            if [ -f "$ZRC" ] && grep -qF "$ZSH_DIR" "$ZRC" 2>/dev/null; then
-                ok "$ZRC already references $ZSH_DIR"
-            elif [ "$RC_EDIT" -eq 1 ] && ask_yes "add the fpath/compinit lines to $ZRC?"; then
-                if rc_append "$ZRC" "$ZSH_DIR" \
-                    "fpath=($ZSH_DIR \$fpath)" \
-                    "autoload -Uz compinit && compinit"; then
-                    ok "wired up completions in $ZRC"
-                    say "  ${D}restart your shell, or run: ${B}source $ZRC && rm -f ~/.zcompdump*${R}"
+            if ! grep -qF ".zsh/completions" "$ZRC" 2>/dev/null; then
+                if [ "$RC_EDIT" -eq 1 ] && ask_yes "add fpath + compinit lines to $ZRC?"; then
+                    rc_append "$ZRC" ".zsh/completions" \
+                        'fpath=(~/.zsh/completions $fpath)' \
+                        'autoload -Uz compinit && compinit' && ok "updated $ZRC (restart your shell)"
+                else
+                    say "  ${D}to enable, add to $ZRC:${R}"
+                    say "    ${B}fpath=(~/.zsh/completions \$fpath)${R}"
+                    say "    ${B}autoload -Uz compinit && compinit${R}"
                 fi
-            else
-                say ""
-                say "  ${D}add to $ZRC to enable:${R}"
-                say "    ${B}fpath=($ZSH_DIR \$fpath)${R}"
-                say "    ${B}autoload -Uz compinit && compinit${R}"
             fi
             ;;
         */bash)
-            BASH_DIR="$HOME/.local/share/rust-clean"
+            BASH_DIR="$HOME/.local/share/$NAME"
             mkdir -p "$BASH_DIR"
             "$DEST" --completion bash > "$BASH_DIR/completion.bash"
-            ok "bash completion → $BASH_DIR/completion.bash"
+            ok "bash completions → $BASH_DIR/completion.bash"
             if [ "$(uname -s)" = "Darwin" ]; then BRC="$HOME/.bash_profile"; else BRC="$HOME/.bashrc"; fi
-            if [ -f "$BRC" ] && grep -qF "$BASH_DIR/completion.bash" "$BRC" 2>/dev/null; then
-                ok "$BRC already sources rust-clean completion"
-            elif [ "$RC_EDIT" -eq 1 ] && ask_yes "source the completion file from $BRC?"; then
-                if rc_append "$BRC" "$BASH_DIR/completion.bash" \
-                    "source $BASH_DIR/completion.bash"; then
-                    ok "wired up completions in $BRC"
-                    say "  ${D}restart your shell, or run: ${B}source $BRC${R}"
+            LINE="source \"$BASH_DIR/completion.bash\""
+            if ! grep -qF "$BASH_DIR/completion.bash" "$BRC" 2>/dev/null; then
+                if [ "$RC_EDIT" -eq 1 ] && ask_yes "add source line to $BRC?"; then
+                    rc_append "$BRC" "$BASH_DIR/completion.bash" "$LINE" && ok "updated $BRC (restart your shell)"
+                else
+                    say "  ${D}to enable, add to $BRC:${R}"
+                    say "    ${B}$LINE${R}"
                 fi
-            else
-                say ""
-                say "  ${D}add to $BRC to enable:${R}"
-                say "    ${B}source $BASH_DIR/completion.bash${R}"
             fi
             ;;
         */fish)
-            FISH_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions"
+            FISH_DIR="$HOME/.config/fish/completions"
             mkdir -p "$FISH_DIR"
-            "$DEST" --completion fish > "$FISH_DIR/rust-clean.fish"
-            ok "fish completion → $FISH_DIR/rust-clean.fish [auto-loaded]"
+            "$DEST" --completion fish > "$FISH_DIR/$NAME.fish"
+            ok "fish completions → $FISH_DIR/$NAME.fish (auto-loaded)"
             ;;
         *)
-            warn "unknown shell (\$SHELL=${SHELL:-unset}); skipping completions"
-            warn "run: rust-clean --completion {bash,zsh,fish} > <your-completion-dir>"
+            warn "unknown shell '${SHELL:-}' — skipping completions (run: $NAME --completion <bash|zsh|fish>)"
             ;;
     esac
 fi
 
-# Optional: bootstrap config via `rust-clean --init`
-CFG="${XDG_CONFIG_HOME:-$HOME/.config}/rust-clean/config.toml"
-if [ ! -f "$CFG" ] && [ "$YES" -ne 1 ] && [ -e /dev/tty ]; then
+# Offer the setup wizard if no config exists yet
+if [ ! -f "$NEW_CFG" ] && [ "$YES" -ne 1 ] && [ -e /dev/tty ]; then
     say ""
     printf "  ${B}Run setup wizard now to pick scan roots? [Y/n]${R} "
     read -r REPLY < /dev/tty 2>/dev/null || REPLY="n"
@@ -232,12 +226,12 @@ if [ ! -f "$CFG" ] && [ "$YES" -ne 1 ] && [ -e /dev/tty ]; then
             "$DEST" --init < /dev/tty
             ;;
         *)
-            say "  ${D}skipped. run ${B}rust-clean --init${R}${D} later to configure.${R}"
+            say "  ${D}skipped. run ${B}$NAME --init${R}${D} later to configure.${R}"
             ;;
     esac
 fi
 
 say ""
 say "${GRN}${B}✓ installed${R}  — try:"
-say "    ${B}rust-clean --dry-run${R}"
+say "    ${B}$NAME --dry-run${R}"
 say ""
