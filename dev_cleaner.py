@@ -6,8 +6,8 @@
 """dev-cleaner: find and remove the build artifacts and caches a dev machine accumulates.
 
 Covers per-project build output (Rust target/, node_modules, .venv, Gradle build/, ...)
-that hasn't been touched in N days, plus global caches (Go build cache, Docker,
-Homebrew, Xcode DerivedData, cargo/npm/uv/pip/gradle caches, ...).
+that hasn't been touched in N days, global caches (Go build cache, Docker,
+Homebrew, Xcode DerivedData, cargo/npm/uv/pip/gradle caches, ...) and idle temp files.
 """
 
 from __future__ import annotations
@@ -17,9 +17,11 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from collections import defaultdict
@@ -159,14 +161,14 @@ RULES: tuple[Rule, ...] = (
 
 ALL_BUILD_DIR_NAMES = {bd.name for r in RULES for bd in r.dirs}
 PROJECT_GROUPS = tuple(dict.fromkeys(r.group for r in RULES))
-GLOBAL_GROUPS = ("go", "docker", "brew", "xcode", "tools")
+GLOBAL_GROUPS = ("go", "docker", "brew", "xcode", "tools", "tmp", "extra", "procs")
 ALL_GROUPS = tuple(dict.fromkeys(PROJECT_GROUPS + GLOBAL_GROUPS))
 
 GROUP_EMOJI = {
     "rust": "🦀", "node": "📦", "python": "🐍", "jvm": "☕", "swift": "🕊️", "elixir": "💧",
     "zig": "⚡", "ocaml": "🐫", "haskell": "λ", "dart": "🎯", "cmake": "🔧", "dotnet": "🟣",
     "terraform": "🏗️", "php": "🐘", "go": "🐹", "docker": "🐳", "brew": "🍺", "xcode": "🍎",
-    "tools": "🧰",
+    "tools": "🧰", "tmp": "🗑️", "extra": "📁", "procs": "🧟",
 }
 
 # Global cache dirs that belong to no project. (label, group, tier, note, candidate paths)
@@ -176,6 +178,11 @@ KNOWN_CACHES: tuple[tuple[str, str, str, str, tuple[Path, ...]], ...] = (
     ("ccache", "tools", SAFE, "compiler cache; rebuilt on demand",
      (HOME / ".ccache", XDG_CACHE / "ccache", MAC_CACHES / "ccache")),
     ("zig global cache", "zig", SAFE, "rebuilt on demand", (XDG_CACHE / "zig",)),
+    ("goimports cache", "go", SAFE, "rebuilt on demand", (MAC_CACHES / "goimports", XDG_CACHE / "goimports")),
+    ("golangci-lint cache", "go", SAFE, "rebuilt on demand",
+     (MAC_CACHES / "golangci-lint", XDG_CACHE / "golangci-lint")),
+    ("gopls cache", "go", SAFE, "rebuilt on demand", (MAC_CACHES / "gopls", XDG_CACHE / "gopls")),
+    ("staticcheck cache", "go", SAFE, "rebuilt on demand", (MAC_CACHES / "staticcheck", XDG_CACHE / "staticcheck")),
     ("npx cache", "node", SAFE, "throwaway npx installs", (HOME / ".npm" / "_npx",)),
     ("TypeScript ATA cache", "node", SAFE, "auto-acquired types", (XDG_CACHE / "typescript",)),
     ("kubectl discovery cache", "tools", SAFE, "", (HOME / ".kube" / "cache",)),
@@ -207,6 +214,8 @@ KNOWN_CACHES: tuple[tuple[str, str, str, str, tuple[Path, ...]], ...] = (
     ("Dart pub cache", "dart", AGGRESSIVE, "re-downloaded", (HOME / ".pub-cache",)),
     ("Terraform plugin cache", "terraform", AGGRESSIVE, "re-downloaded",
      (HOME / ".terraform.d" / "plugin-cache",)),
+    ("Trivy cache", "tools", AGGRESSIVE, "vulnerability DB; re-downloaded",
+     (MAC_CACHES / "trivy", XDG_CACHE / "trivy")),
     ("Helm cache", "tools", AGGRESSIVE, "re-downloaded", (MAC_CACHES / "helm", XDG_CACHE / "helm")),
     ("Bazel output bases", "tools", AGGRESSIVE, "run `bazel shutdown` first", (XDG_CACHE / "bazel",)),
     ("JetBrains caches", "tools", AGGRESSIVE, "IDE re-indexes projects",
@@ -226,6 +235,8 @@ DEFAULTS: dict = {
     "size_jobs": 16,
     "clean_jobs": 4,
     "docker": {"volumes": False},
+    "extra": [],
+    "procs": {"orphan_dirs": []},
 }
 
 
@@ -241,7 +252,7 @@ def legacy_config_path() -> Path:
 
 def render_config(roots: list[str], days: float, ignore: list[str] | None = None,
                   aggressive: bool = False, skip: list[str] | None = None,
-                  docker_volumes: bool = False) -> str:
+                  docker_volumes: bool | str = False) -> str:
     """Serialize a config as TOML with comments."""
     ignore = ignore or []
     skip = skip or []
@@ -273,8 +284,21 @@ size_jobs = 16
 clean_jobs = 4
 
 [docker]
-# Prune unused anonymous volumes too. Off by default: volumes hold data.
-volumes = {str(docker_volumes).lower()}
+# Prune unused volumes too. Off by default: volumes hold data.
+# true = anonymous volumes only, "all" = named ones as well.
+volumes = {json.dumps(docker_volumes)}
+
+[procs]
+# Orphaned processes (parent gone, idle past `days`) are stopped when their
+# executable lives in a temp dir. List more dirs whose executables are only
+# ever meant to run under a parent, e.g. a tool's plugin dir.
+orphan_dirs = []
+
+# Disposable dirs of your own: children idle longer than `days` are removed
+# (`days` is optional and defaults to the global one above).
+# [[extra]]
+# path = "~/Library/Caches/mytool"
+# days = 3
 """
 
 
@@ -310,7 +334,7 @@ _dev_cleaner() {{
     COMPREPLY=()
     cur="${{COMP_WORDS[COMP_CWORD]}}"
     prev="${{COMP_WORDS[COMP_CWORD-1]}}"
-    opts="--root --days --hours --dry-run --yes --aggressive --only --skip --list --size-jobs --clean-jobs --config --init --show-config --completion -n -y -a -h --help"
+    opts="--root --days --hours --dry-run --yes --aggressive --only --skip --audit --mem --list --size-jobs --clean-jobs --config --init --show-config --completion -n -y -a -h --help"
     case "$prev" in
         --root|--config) COMPREPLY=( $(compgen -f -- "$cur") ); return ;;
         --completion) COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ); return ;;
@@ -335,6 +359,8 @@ _dev_cleaner() {{
         '(-a --aggressive)'{{-a,--aggressive}}'[Also clean dependency caches / unused images]' \
         '--only[Only run these groups]:groups:_values -s , group {_GROUPS_WS}' \
         '--skip[Skip these groups]:groups:_values -s , group {_GROUPS_WS}' \
+        '--audit[Show the biggest dirs and how much of each would be freed]' \
+        '--mem[Show which programs hold the memory and how many are orphaned]' \
         '--list[List cleaner groups and exit]' \
         '--size-jobs[Parallel sizing workers]:N:' \
         '--clean-jobs[Parallel delete workers]:N:' \
@@ -356,6 +382,8 @@ complete -c dev-cleaner -s y -l yes -d "Skip confirmation prompt"
 complete -c dev-cleaner -s a -l aggressive -d "Also clean dependency caches / unused images"
 complete -c dev-cleaner -l only -d "Only run these groups" -x -a "{_GROUPS_WS}"
 complete -c dev-cleaner -l skip -d "Skip these groups" -x -a "{_GROUPS_WS}"
+complete -c dev-cleaner -l audit -d "Show the biggest dirs and how much of each would be freed"
+complete -c dev-cleaner -l mem -d "Show which programs hold the memory and how many are orphaned"
 complete -c dev-cleaner -l list -d "List cleaner groups and exit"
 complete -c dev-cleaner -l size-jobs -d "Parallel sizing workers" -x
 complete -c dev-cleaner -l clean-jobs -d "Parallel delete workers" -x
@@ -450,6 +478,43 @@ def dir_size(path: Path) -> int:
     return total
 
 
+def same_fs(path: Path, dev: int) -> bool:
+    """False across a mount point. ~/OrbStack, for one, is the docker VM's live filesystem."""
+    try:
+        return os.lstat(path).st_dev == dev
+    except OSError:
+        return False
+
+
+def paths_size(paths: list[Path], workers: int) -> dict[Path, int]:
+    """Disk usage of many paths at once: a few batched `du` calls instead of one each."""
+    if not shutil.which("du"):
+        return {p: dir_size(p) for p in paths}
+
+    def batch(chunk: list[Path]) -> dict[Path, int]:
+        out: dict[Path, int] = {}
+        r = run(["du", "-sk", *map(str, chunk)], timeout=1800)
+        for line in (r.stdout.splitlines() if r else ()):
+            kb, _, name = line.partition("\t")
+            if kb.isdigit():
+                out[Path(name)] = int(kb) * 1024
+        return out
+
+    sizes: dict[Path, int] = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for part in pool.map(batch, [paths[i:i + 200] for i in range(0, len(paths), 200)]):
+            sizes.update(part)
+    return sizes
+
+
+def file_disk_size(path: Path) -> int:
+    """Blocks actually allocated: VM disk images are sparse, st_size lies."""
+    try:
+        return os.stat(path).st_blocks * 512
+    except OSError:
+        return 0
+
+
 def _force_writable(path: Path) -> None:
     try:
         os.chmod(path, os.lstat(path).st_mode | stat.S_IWUSR | stat.S_IXUSR)
@@ -514,6 +579,7 @@ class Item:
     action: Callable[[], str | None] | None = None  # returns a one-line result
     shadowed: bool = False           # safe item made redundant by an aggressive one
     project: Path | None = None
+    ram: bool = False                # size is memory, not disk: shown, never summed
 
     @property
     def is_project(self) -> bool:
@@ -530,8 +596,10 @@ class Context:
     extra_skip: set[str]
     groups: set[str]
     aggressive: bool
-    docker_volumes: bool
+    docker_volumes: bool | str       # False | True (anonymous only) | "all"
     size_jobs: int
+    sweeps: list[Sweep] = field(default_factory=list)  # user-declared, from [[extra]]
+    orphan_dirs: list[Path] = field(default_factory=list)  # from [procs], on top of the temp dirs
     warnings: list[str] = field(default_factory=list)
 
 
@@ -544,6 +612,10 @@ def find_projects(root: Path, extra_skip: set[str] | None = None):
     """Yield (group, project_dir, build_dir, BuildDir) for every build dir under root."""
     root = root.expanduser().resolve()
     skip = SKIP_DIRS | ALWAYS_PRUNE | (extra_skip or set())
+    try:
+        dev = os.stat(root).st_dev
+    except OSError:
+        return
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         fset = set(filenames)
         here = Path(dirpath)
@@ -561,7 +633,7 @@ def find_projects(root: Path, extra_skip: set[str] | None = None):
                     continue
                 matched.add(bd.name)
                 yield rule.group, here, p, bd
-        dirnames[:] = [d for d in dirnames if d not in skip and d not in matched]
+        dirnames[:] = [d for d in dirnames if d not in skip and d not in matched and same_fs(here / d, dev)]
 
 
 def project_activity(project: Path) -> float:
@@ -577,8 +649,9 @@ def project_activity(project: Path) -> float:
         latest = project.stat().st_mtime
     except OSError:
         pass
+    dev = os.stat(project).st_dev if project.exists() else 0
     for dirpath, dirnames, filenames in os.walk(project, followlinks=False):
-        dirnames[:] = [d for d in dirnames if d not in prune]
+        dirnames[:] = [d for d in dirnames if d not in prune and same_fs(Path(dirpath) / d, dev)]
         for f in filenames:
             try:
                 m = os.lstat(os.path.join(dirpath, f)).st_mtime
@@ -775,18 +848,63 @@ def _docker_df(docker: str) -> dict[str, dict]:
     return out
 
 
+def docker_vm_disks() -> list[tuple[str, Path]]:
+    """Host-side disk images of local docker VMs: where the space really sits on macOS."""
+    lib = HOME / "Library"
+    cands = [("OrbStack", p) for p in (lib / "Group Containers").glob("*.dev.orbstack/data/data.img*")]
+    cands += [
+        ("OrbStack", HOME / ".orbstack" / "data" / "data.img"),
+        ("Docker Desktop", lib / "Containers" / "com.docker.docker" / "Data" / "vms" / "0" / "data" / "Docker.raw"),
+        ("Colima", HOME / ".colima" / "_lima" / "_disks" / "colima" / "datadisk"),
+        ("Colima", HOME / ".colima" / "_lima" / "colima" / "diffdisk"),
+        ("Rancher Desktop", lib / "Application Support" / "rancher-desktop" / "lima" / "0" / "diffdisk"),
+    ]
+    return [(name, p) for name, p in cands if p.is_file()]
+
+
+def _container_builders(docker: str) -> list[str]:
+    """buildx builders running in their own container: `docker system prune` never touches their cache."""
+    r = run([docker, "buildx", "ls", "--format", "{{json .}}"], timeout=30)
+    names: list[str] = []
+    if r is None or r.returncode != 0:
+        return names
+    for line in r.stdout.splitlines():
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        endpoints = [n.get("Endpoint") or "" for n in d.get("Nodes") or []]
+        remote = endpoints and all(e.startswith(("ssh://", "tcp://")) for e in endpoints)
+        if d.get("Driver") == "docker-container" and not remote and d.get("Name") not in names:
+            names.append(d["Name"])
+    return names
+
+
+def _buildx_reclaimable(docker: str, builder: str) -> int | None:
+    r = run([docker, "buildx", "du", "--builder", builder], timeout=120)
+    if r is None or r.returncode != 0:
+        return None
+    m = re.search(r"^Reclaimable:\s*(\S+)", r.stdout, re.M)
+    return parse_size(m.group(1)) if m else None
+
+
 def scan_docker(ctx: Context) -> list[Item]:
     docker = shutil.which("docker")
     if not docker:
         return []
+    held = ", ".join(f"{human_size(sz)} in the {name} VM disk" for name, sz in
+                     ((name, file_disk_size(p)) for name, p in docker_vm_disks()) if sz >= 10 * 1024**3)
     info = run([docker, "info", "--format", "{{.ServerVersion}}"], timeout=15)
     if info is None or info.returncode != 0:
-        ctx.warnings.append("docker: daemon not reachable — skipped")
+        ctx.warnings.append("docker: daemon not reachable — skipped"
+                            + (f" ({held}; start it and re-run)" if held else ""))
         return []
+    if held:
+        ctx.warnings.append(f"docker: {held} — the file shrinks as images, volumes and build cache go")
 
     df = _docker_df(docker)
     if not df:
-        ctx.warnings.append("docker: `docker system df` failed — sizes unknown")
+        ctx.warnings.append("docker: `docker system df` failed — some sizes unknown")
 
     def reclaimable(t: str) -> int | None:
         return parse_size(df[t]["Reclaimable"]) if t in df else None
@@ -802,31 +920,46 @@ def scan_docker(ctx: Context) -> list[Item]:
                 return line.strip()
         return None
 
-    items = []
-    parts = [reclaimable("Containers"), reclaimable("Build Cache"), dangling]
-    safe_size = sum(p for p in parts if p is not None) if any(p is not None for p in parts) else None
-    if safe_size is None or safe_size > 0:
-        items.append(Item(
-            group="docker", label="docker system prune", size=safe_size, tier=SAFE,
-            note="stopped containers, dangling images, unused networks, build cache",
-            mode="action", action=_cmd_action([docker, "system", "prune", "-f"], summary=summarize),
-        ))
+    def prune(label: str, size: int | None, tier: str, note: str, *args: str) -> None:
+        # Unknown is not zero: a failed `system df` must not hide the row.
+        if size is None or size > 0:
+            items.append(Item(group="docker", label=label, size=size, tier=tier, note=note, mode="action",
+                              action=_cmd_action([docker, *args], summary=summarize)))
+
+    items: list[Item] = []
+    containers = reclaimable("Containers")
+    prune("docker system prune", None if None in (containers, dangling) else containers + dangling, SAFE,
+          "stopped containers, dangling images, unused networks", "system", "prune", "-f")
+
+    cache = reclaimable("Build Cache")
+    if cache is None:
+        ctxname = run([docker, "context", "show"], timeout=15)
+        if ctxname and ctxname.returncode == 0 and ctxname.stdout.strip():
+            cache = _buildx_reclaimable(docker, ctxname.stdout.strip())
+    prune("docker builder prune -a", cache, SAFE, "build cache; rebuilt on demand",
+          "builder", "prune", "-a", "-f")
+    for name in _container_builders(docker):
+        prune(f"docker buildx prune ({name})", _buildx_reclaimable(docker, name), SAFE,
+              "build cache of a container builder; rebuilt on demand",
+              "buildx", "prune", "--builder", name, "-a", "-f")
+
     img = reclaimable("Images")
-    unused = max(0, img - (dangling or 0)) if img is not None else None
-    if unused is None or unused > 0:
-        items.append(Item(
-            group="docker", label="docker image prune -a", size=unused, tier=AGGRESSIVE,
-            note="every image not used by a container; re-pulled",
-            mode="action", action=_cmd_action([docker, "image", "prune", "-a", "-f"], summary=summarize),
-        ))
-    if ctx.docker_volumes:
-        vol = reclaimable("Local Volumes")
-        if vol is None or vol > 0:
-            items.append(Item(
-                group="docker", label="docker volume prune", size=vol, tier=SAFE,
-                note="unused anonymous volumes (enabled in config)",
-                mode="action", action=_cmd_action([docker, "volume", "prune", "-f"], summary=summarize),
-            ))
+    prune("docker image prune -a", max(0, img - (dangling or 0)) if img is not None else None, AGGRESSIVE,
+          "every image not used by a container; re-pulled", "image", "prune", "-a", "-f")
+
+    vol = reclaimable("Local Volumes")
+    r = run([docker, "volume", "ls", "-qf", "dangling=true"], timeout=30)
+    unused = len(r.stdout.split()) if r and r.returncode == 0 else 0
+    if ctx.docker_volumes == "all":
+        prune("docker volume prune -a", vol if unused else 0, SAFE,
+              f"{unused} unused volume(s), named ones included (enabled in config)", "volume", "prune", "-a", "-f")
+    elif ctx.docker_volumes:
+        prune("docker volume prune", None if unused else 0, SAFE,
+              "unused anonymous volumes (enabled in config)", "volume", "prune", "-f")
+    elif unused:
+        ctx.warnings.append(
+            f"docker: {unused} unused volume(s)" + (f" holding {human_size(vol)}" if vol else "")
+            + " left alone, volumes hold data — opt in with docker.volumes = true (anonymous) or \"all\"")
     return items
 
 
@@ -901,6 +1034,337 @@ def scan_known_caches(ctx: Context) -> list[Item]:
     return items
 
 
+# ---------------------------------------------------------------------------
+# Temp dirs and user-declared sweeps
+# ---------------------------------------------------------------------------
+
+# Temp entries that belong to running programs however idle they look.
+TMP_KEEP_PREFIXES = ("com.apple.", ".com.apple.", "tmux-", "ssh-", "systemd-private-", "snap-private-",
+                     ".X", ".ICE-", ".font-", ".XIM-", ".Test-")
+TMP_KEEP_NAMES = {"TemporaryItems"}
+
+
+@dataclass(frozen=True)
+class Sweep:
+    """Dirs whose idle children are disposable: temp dirs, caches the user declared."""
+    group: str
+    label: str
+    path: Path                       # what is shown
+    containers: tuple[Path, ...]     # dirs whose direct children are the candidates
+    cutoff: float | None = None      # None = the run's idle threshold
+    note: str = ""
+
+
+def idle_since(path: Path, depth: int = 2, budget: int = 2000) -> float | None:
+    """Newest mtime in `path` down to `depth` levels; None when it must be left alone.
+
+    Left alone: other users' files, symlinks, sockets/fifos/devices and any dir
+    holding one (a live program's IPC). A dir's own mtime only moves when a
+    direct child comes or goes, hence the shallow look inside.
+    """
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if st.st_uid != os.getuid() or not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
+        return None
+    latest = st.st_mtime
+    level = [str(path)] if stat.S_ISDIR(st.st_mode) else []
+    for _ in range(depth):
+        nxt: list[str] = []
+        for d in level:
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        budget -= 1
+                        if budget < 0:
+                            return latest
+                        mode = e.stat(follow_symlinks=False)
+                        if not (stat.S_ISDIR(mode.st_mode) or stat.S_ISREG(mode.st_mode)
+                                or stat.S_ISLNK(mode.st_mode)):
+                            return None
+                        latest = max(latest, mode.st_mtime)
+                        if stat.S_ISDIR(mode.st_mode):
+                            nxt.append(e.path)
+            except OSError:
+                continue
+        level = nxt
+    return latest
+
+
+def tmp_sweeps() -> list[Sweep]:
+    out: list[Sweep] = []
+    seen: set[Path] = set()
+    bases = []
+    for base in (Path("/tmp"), Path(tempfile.gettempdir())):
+        try:
+            base = base.resolve()
+        except OSError:
+            continue
+        if base.is_dir() and base not in seen:
+            seen.add(base)
+            bases.append(base)
+            out.append(Sweep("tmp", "idle temp files", base, (base,)))
+    # Claude Code: <tmp>/claude-<uid>/<project>/<session>/{scratchpad,tasks}.
+    for base in bases:
+        claude = base / f"claude-{os.getuid()}"
+        if claude.is_dir():
+            projects = tuple(p for p in claude.iterdir() if p.name.startswith("-") and p.is_dir())
+            out.append(Sweep("tmp", "idle Claude Code scratch", claude, (claude, *projects),
+                             note="session scratchpads and task output"))
+    return out
+
+
+def _sweep_action(entries: list[Path], cutoff: float) -> Callable[[], str | None]:
+    def remove(p: Path) -> bool | None:
+        m = idle_since(p)
+        if m is None or m >= cutoff:  # back in use (or gone) since the scan
+            return None
+        try:
+            if stat.S_ISDIR(os.lstat(p).st_mode):
+                force_rmtree(p)
+            else:
+                p.unlink()
+            return True
+        except OSError:
+            return False
+
+    def act() -> str | None:
+        with ThreadPoolExecutor(max_workers=DEFAULTS["clean_jobs"]) as pool:
+            results = list(pool.map(remove, entries))
+        removed, failed, skipped = results.count(True), results.count(False), results.count(None)
+        if failed and not removed:
+            raise RuntimeError(f"could not remove any of {failed} entries")
+        return (f"removed {removed}" + (f", {failed} failed" if failed else "")
+                + (f", {skipped} back in use" if skipped else ""))
+    return act
+
+
+def scan_sweeps(sweeps: list[Sweep], ctx: Context) -> list[Item]:
+    # A dir that is itself swept is never a candidate of its parent.
+    reserved = {c for s in [*tmp_sweeps(), *ctx.sweeps] for c in s.containers}
+    items = []
+    for sw in sweeps:
+        cutoff = sw.cutoff if sw.cutoff is not None else ctx.cutoff
+        stale: list[Path] = []
+        for c in sw.containers:
+            try:
+                names, dev = os.listdir(c), os.stat(c).st_dev
+            except OSError:
+                continue
+            for name in names:
+                p = c / name
+                if p in reserved or name in TMP_KEEP_NAMES or name.startswith(TMP_KEEP_PREFIXES):
+                    continue
+                if not same_fs(p, dev):
+                    continue
+                m = idle_since(p)
+                if m is not None and m < cutoff:
+                    stale.append(p)
+        if not stale:
+            continue
+        sizes = paths_size(stale, ctx.size_jobs)
+        top = sorted(sizes.items(), key=lambda kv: -kv[1])[:3]
+        note = f"{len(stale)} entries" + (
+            "; biggest: " + ", ".join(f"{p.name[:28]} {human_size(n)}" for p, n in top) if top else "")
+        items.append(Item(
+            group=sw.group, label=sw.label, path=sw.path, size=sum(sizes.values()), tier=SAFE,
+            note=f"{sw.note}; {note}" if sw.note else note, mode="action",
+            action=_sweep_action(stale, cutoff),
+        ))
+    return items
+
+
+def scan_tmp(ctx: Context) -> list[Item]:
+    return scan_sweeps(tmp_sweeps(), ctx)
+
+
+def scan_extra(ctx: Context) -> list[Item]:
+    return scan_sweeps(ctx.sweeps, ctx)
+
+
+# ---------------------------------------------------------------------------
+# Processes: orphans that hold memory long after their parent died
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Proc:
+    pid: int
+    ppid: int
+    uid: int
+    age: float                       # seconds since start
+    cpu: float                       # % right now
+    mem: int                         # bytes: footprint incl. compressed/swapped where known, else RSS
+    exe: str
+
+    @property
+    def name(self) -> str:
+        return os.path.basename(self.exe)
+
+
+def parse_etime(s: str) -> float:
+    """ps etime, [[dd-]hh:]mm:ss → seconds."""
+    days, _, rest = s.rpartition("-")
+    parts = [int(x) for x in rest.split(":")]
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    return int(days or 0) * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+
+
+def _footprints() -> dict[int, int]:
+    """pid → memory footprint. RSS collapses once a machine swaps, which is exactly when this matters."""
+    if not IS_MAC:
+        return {}
+    r = run(["top", "-l", "1", "-n", "100000", "-stats", "pid,mem"], timeout=60)
+    out: dict[int, int] = {}
+    for line in (r.stdout.splitlines() if r and r.returncode == 0 else ()):
+        m = re.fullmatch(r"\s*(\d+)\s+(\d+)([BKMG])[+-]?\s*", line)
+        if m:
+            out[int(m.group(1))] = int(m.group(2)) * 1024 ** "BKMG".index(m.group(3))
+    return out
+
+
+def list_procs() -> list[Proc]:
+    r = run(["ps", "-A", "-o", "pid=,ppid=,uid=,etime=,%cpu=,rss=,comm="], timeout=30)
+    if r is None or r.returncode != 0:
+        return []
+    foot = _footprints()
+    procs = []
+    for line in r.stdout.splitlines():
+        f = line.split(None, 6)
+        if len(f) < 7:
+            continue
+        try:
+            pid, exe = int(f[0]), f[6].strip()
+            if not IS_MAC:  # Linux `comm` is a bare, truncated name
+                try:
+                    exe = os.readlink(f"/proc/{pid}/exe")
+                except OSError:
+                    pass
+            procs.append(Proc(pid, int(f[1]), int(f[2]), parse_etime(f[3]), float(f[4].replace(",", ".")),
+                              foot.get(pid, int(f[5]) * 1024), exe))
+        except ValueError:
+            continue
+    return procs
+
+
+def orphan_roots(ctx: Context) -> tuple[str, ...]:
+    """Dirs whose executables never run on their own: test binaries, tool plugins."""
+    dirs = {Path("/tmp"), Path(tempfile.gettempdir()), *(d.expanduser() for d in ctx.orphan_dirs)}
+    out = set()
+    for d in dirs:
+        for form in (d, d.resolve()):  # ps reports /var/folders/…, the fs says /private/var/folders/…
+            out.add(str(form).rstrip("/") + "/")
+    return tuple(sorted(out))
+
+
+def find_orphans(procs: list[Proc], roots: tuple[str, ...], min_age: float) -> list[Proc]:
+    """Mine, re-parented to init, idle, older than the threshold, running from one of `roots`."""
+    me = os.getuid()
+    return [p for p in procs
+            if p.ppid == 1 and p.uid == me and p.age >= min_age and p.cpu <= 1.0 and p.exe.startswith(roots)]
+
+
+def _name_counts(procs: list[Proc], n: int = 5) -> str:
+    counts: dict[str, int] = defaultdict(int)
+    for p in procs:
+        counts[p.name] += 1
+    top = sorted(counts.items(), key=lambda kv: -kv[1])
+    return ", ".join(f"{name} ×{c}" for name, c in top[:n]) + (f", +{len(top) - n} more" if len(top) > n else "")
+
+
+def _stop_action(targets: list[Proc], roots: tuple[str, ...], min_age: float) -> Callable[[], str | None]:
+    def act() -> str | None:
+        # Pids get recycled and orphans get adopted: only signal what still qualifies.
+        want = {(p.pid, p.exe) for p in targets}
+        live = [p for p in find_orphans(list_procs(), roots, min_age) if (p.pid, p.exe) in want]
+
+        def alive(p: Proc) -> bool:
+            try:
+                os.kill(p.pid, 0)
+                return True
+            except OSError:
+                return False
+
+        def send(procs: list[Proc], sig: int) -> None:
+            for p in procs:
+                try:
+                    os.kill(p.pid, sig)
+                except OSError:
+                    pass
+
+        send(live, signal.SIGTERM)  # lets a supervisor tear its own children down
+        deadline = time.time() + 8
+        while time.time() < deadline and any(alive(p) for p in live):
+            time.sleep(0.25)
+        stuck = [p for p in live if alive(p)]
+        send(stuck, signal.SIGKILL)
+        return f"stopped {len(live)}" + (f" ({len(stuck)} forced)" if stuck else "")
+    return act
+
+
+def scan_procs(ctx: Context) -> list[Item]:
+    roots, min_age = orphan_roots(ctx), time.time() - ctx.cutoff
+    orphans = find_orphans(list_procs(), roots, min_age)
+    if not orphans:
+        return []
+    return [Item(
+        group="procs", label="orphaned processes", size=sum(p.mem for p in orphans), tier=SAFE, ram=True,
+        note=f"{len(orphans)} idle, parent gone: {_name_counts(orphans)}",
+        mode="action", action=_stop_action(orphans, roots, min_age),
+    )]
+
+
+def run_mem(ctx: Context) -> None:
+    """Read-only: what holds the memory, and how much of it is leaked."""
+    procs = list_procs()
+    if not procs:
+        console.print("[yellow]mem: could not list processes[/]")
+        return
+    if IS_MAC:
+        swap = run(["sysctl", "-n", "vm.swapusage"], timeout=10)
+        m = re.search(r"total = ([\d.]+M)\s+used = ([\d.]+M)", swap.stdout) if swap else None
+        if m:
+            total, used = (parse_size(x + "B", base=1024) or 0 for x in m.groups())
+            style = "red bold" if total and used / total > 0.5 else "green"
+            console.print(Text.from_markup(
+                f"  [dim]swap:[/] [{style}]{human_size(used)}[/] [dim]of {human_size(total)} in use"
+                + (" — the machine is out of RAM; the kernel burns CPU compressing and paging[/]"
+                   if style != "green" else "[/]")))
+    by_name: dict[str, list[Proc]] = defaultdict(list)
+    for p in procs:
+        by_name[p.name].append(p)
+    rows = sorted(by_name.items(), key=lambda kv: -sum(p.mem for p in kv[1]))
+
+    table = Table(title="[bold]🧠  where the memory went[/] [dim](by program)[/]", box=ROUNDED,
+                  border_style="magenta", header_style="bold magenta", title_justify="left", expand=True)
+    table.add_column("memory", justify="right", min_width=9)
+    table.add_column("procs", justify="right")
+    table.add_column("idle >1d", justify="right")
+    table.add_column("oldest", justify="right")
+    table.add_column("program", overflow="fold")
+    for name, ps_ in rows[:20]:
+        mem = sum(p.mem for p in ps_)
+        if mem < 256 * 1024**2:
+            break
+        old = sum(1 for p in ps_ if p.age >= 86400 and p.cpu <= 1.0)
+        days = max(p.age for p in ps_) / 86400
+        table.add_row(Text(human_size(mem), style=size_color(mem)), str(len(ps_)),
+                      Text(str(old), style="yellow" if old >= 5 else "dim") if old else Text("—", style="dim"),
+                      Text(f"{days:.1f}d", style=age_color(days) if len(ps_) > 1 else "dim"), name)
+    console.print()
+    console.print(table)
+    orphans = find_orphans(procs, orphan_roots(ctx), time.time() - ctx.cutoff)
+    if orphans:
+        console.print(Text.from_markup(
+            f"[yellow]![/] [bold]{len(orphans)}[/] [dim]orphaned process(es) holding[/] "
+            f"[bold]{human_size(sum(p.mem for p in orphans))}[/][dim]: {escape(_name_counts(orphans))}. "
+            f"stop them with[/] [bold]dev-cleaner --only procs[/]"))
+    console.print("[dim]many old idle copies of one program (agent sessions, language servers) are sessions "
+                  "nobody closed: close them where they were opened.[/]")
+
+
 GLOBAL_SCANNERS: dict[str, Callable[[Context], list[Item]]] = {
     "rust": scan_rust_global,
     "go": scan_go,
@@ -909,6 +1373,9 @@ GLOBAL_SCANNERS: dict[str, Callable[[Context], list[Item]]] = {
     "docker": scan_docker,
     "brew": scan_brew,
     "xcode": scan_xcode,
+    "tmp": scan_tmp,
+    "extra": scan_extra,
+    "procs": scan_procs,
 }
 
 GROUP_HELP: dict[str, tuple[str, str]] = {
@@ -927,11 +1394,15 @@ GROUP_HELP: dict[str, tuple[str, str]] = {
     "dotnet": ("stale bin/, obj/", "~/.nuget/packages"),
     "terraform": ("", ".terraform/ dirs, plugin cache"),
     "php": ("", "vendor/, composer cache"),
-    "go": ("go build cache", "go module cache"),
-    "docker": ("system prune: stopped containers, dangling images, networks, build cache", "all unused images (image prune -a)"),
+    "go": ("go build cache, gopls / goimports / golangci-lint / staticcheck caches", "go module cache"),
+    "docker": ("system prune (stopped containers, dangling images, networks), build cache of every builder incl. buildx containers; unused volumes if enabled in config",
+               "all unused images (image prune -a)"),
     "brew": ("brew cleanup --prune=all", "brew autoremove"),
     "xcode": ("DerivedData, simulator caches, unavailable simulators", "*OS DeviceSupport"),
-    "tools": ("ccache, kubectl cache", "playwright/puppeteer/cypress browsers, electron, deno, helm, bazel, JetBrains caches"),
+    "tools": ("ccache, kubectl cache", "playwright/puppeteer/cypress browsers, electron, deno, trivy, helm, bazel, JetBrains caches"),
+    "tmp": ("entries of /tmp and $TMPDIR, and Claude Code session scratch, idle past the threshold", ""),
+    "extra": ("idle children of the dirs listed under [[extra]] in the config", ""),
+    "procs": ("stops idle orphaned processes (parent gone) running from a temp dir or a [procs] orphan_dirs dir", ""),
 }
 
 
@@ -998,10 +1469,15 @@ def scan_all(ctx: Context) -> list[Item]:
     return out
 
 
+TINY = 1024**2
+
+
 def partition(items: list[Item], ctx: Context):
     """→ (to_clean, active_projects, aggressive_extra)."""
     to_clean, active, extra = [], [], []
     for it in items:
+        if it.is_project and it.size is not None and it.size < TINY:
+            continue  # empty build dirs (test fixtures, fresh clones): rows of noise, nothing to free
         if it.is_project and it.mtime is not None and it.mtime >= ctx.cutoff:
             active.append(it)
             continue
@@ -1062,7 +1538,7 @@ def render_table(items: list[Item], threshold: str, aggressive: bool) -> Table:
     # Group order: biggest group first.
     totals: dict[str, int] = defaultdict(int)
     for it in items:
-        totals[it.group] += it.size or 0
+        totals[it.group] += 0 if it.ram else it.size or 0
     order = sorted(totals, key=lambda g: -totals[g])
 
     now = time.time()
@@ -1071,7 +1547,7 @@ def render_table(items: list[Item], threshold: str, aggressive: bool) -> Table:
         if gi:
             table.add_section()
         table.add_row("", "", "", Text.from_markup(
-            f"{GROUP_EMOJI.get(g, '')} [bold]{g}[/]  [dim]{human_size(totals[g])}[/]"))
+            f"{GROUP_EMOJI.get(g, '')} [bold]{g}[/]" + (f"  [dim]{human_size(totals[g])}[/]" if totals[g] else "")))
         for it in (i for i in items if i.group == g):
             n += 1
             if it.mtime is not None:
@@ -1091,9 +1567,10 @@ def render_table(items: list[Item], threshold: str, aggressive: bool) -> Table:
                 what.append("  aggressive", style="red dim")
             if it.note and not it.is_project:  # project rows: the dir name says it all
                 what.append(f"  ({it.note})", style="dim italic")
-            table.add_row(str(n), Text(human_size(it.size), style=size_color(it.size)), age, what)
+            size = Text(human_size(it.size) + (" RAM" if it.ram else ""), style="cyan" if it.ram else size_color(it.size))
+            table.add_row(str(n), size, age, what)
 
-    total = sum(i.size or 0 for i in items)
+    total = sum(i.size or 0 for i in items if not i.ram)
     unknown = sum(1 for i in items if i.size is None)
     table.add_section()
     table.add_row(
@@ -1122,7 +1599,7 @@ def render_notes(active: list[Item], extra: list[Item], threshold: str, warnings
             f"cache(s) / unused image(s) with[/] [bold]--aggressive[/][dim]: {top}{more}[/]"
         ))
     for w in warnings:
-        out.append(Text.from_markup(f"[yellow]![/] [dim]{w}[/]"))
+        out.append(Text.from_markup(f"[yellow]![/] [dim]{escape(w)}[/]"))
     return out
 
 
@@ -1135,6 +1612,113 @@ def render_groups_table() -> Table:
         safe, aggr = GROUP_HELP.get(g, ("", ""))
         t.add_row(f"{GROUP_EMOJI.get(g, '')} {g}", safe or "—", aggr or "—")
     return t
+
+
+# ---------------------------------------------------------------------------
+# Audit: where the disk went, and how much of it we cover
+# ---------------------------------------------------------------------------
+
+AUDIT_MIN = 1024**3
+AUDIT_DEPTH = 3
+AUDIT_ROWS = 30
+
+
+def audit_rows(du_out: str, root: Path, min_bytes: int = AUDIT_MIN) -> list[tuple[Path, int]]:
+    """Reduce `du -k -d N` output to the dirs worth showing: big ones, as deep as the bulk goes."""
+    size: dict[Path, int] = {}
+    for line in du_out.splitlines():
+        kb, _, name = line.partition("\t")
+        if kb.isdigit():
+            size[Path(name)] = int(kb) * 1024
+    kids: dict[Path, list[Path]] = defaultdict(list)
+    for d in size:
+        kids[d.parent].append(d)
+    rows: list[tuple[Path, int]] = []
+
+    def pick(d: Path) -> None:
+        big = [k for k in kids.get(d, ()) if size[k] >= min_bytes]
+        if big and sum(size[k] for k in big) >= size[d] / 2:
+            for k in big:
+                pick(k)
+        elif size[d] >= min_bytes:
+            rows.append((d, size[d]))
+
+    if root in size:
+        pick(root)
+    return rows
+
+
+def covered(d: Path, total: int, items: list[Item]) -> int:
+    """How much of dir `d` the given items would free."""
+    n = 0
+    for it in items:
+        if it.path is None or not it.size:
+            continue
+        if it.path == d or d in it.path.parents:
+            n += it.size
+        elif it.path in d.parents:
+            return total
+    return min(n, total)
+
+
+def run_audit(ctx: Context, to_clean: list[Item], active: list[Item], extra: list[Item]) -> None:
+    home = HOME.resolve()
+    tmp = [s.path for s in tmp_sweeps()]
+    swept = [d for d in tmp if home not in (d, *d.parents) and not any(o in d.parents for o in tmp)]
+    rows: list[tuple[Path, int]] = []
+    with make_progress() as progress:
+        task = progress.add_task(f"measuring {tilde(home)} (this walks everything; minutes on a full disk)",
+                                 detail="", total=None)
+        r = run(["du", "-x", "-k", "-d", str(AUDIT_DEPTH), str(home)], timeout=3600)
+        if r is not None:  # du exits 1 on the dirs macOS won't let it read; the rest is still good
+            rows += audit_rows(r.stdout, home)
+        progress.update(task, description="measuring temp dirs")
+        rows += [(d, n) for d, n in paths_size(swept, ctx.size_jobs).items() if n >= AUDIT_MIN]
+    if not rows:
+        console.print("[yellow]audit: could not measure anything (is `du` installed?)[/]")
+        return
+    rows.sort(key=lambda dn: -dn[1])
+    vm = {p: name for name, p in docker_vm_disks()}
+
+    table = Table(
+        title="[bold]🔎  where the disk went[/] [dim](dirs over 1 GB, and what dev-cleaner frees in each)[/]",
+        box=ROUNDED, border_style="magenta", header_style="bold magenta", title_justify="left", expand=True,
+    )
+    table.add_column("size", justify="right", min_width=9)
+    table.add_column("frees now", justify="right", min_width=9)
+    table.add_column("--aggressive", justify="right", min_width=9)
+    table.add_column("where", overflow="fold")
+
+    def cell(v: int) -> Text:
+        return Text(human_size(v), style=size_color(v)) if v else Text("—", style="dim")
+
+    partial = set(ALL_GROUPS) - ctx.groups  # --only/--skip: "not covered" may just mean "not run"
+    blind = 0
+    for d, n in rows[:AUDIT_ROWS]:
+        now, more, busy = covered(d, n, to_clean), covered(d, n, extra), covered(d, n, active)
+        where = Text(tilde(d))
+        disk = next((name for p, name in vm.items() if d == p or d in p.parents), None)
+        if disk:
+            where.append(f"  ({disk} VM disk: freed from inside, see the docker group)", style="dim italic")
+        elif busy:
+            where.append(f"  ({human_size(busy)} in active projects)", style="dim italic")
+        elif not (now or more):
+            blind += n
+            where.append("  not covered" + (" by the groups run" if partial else ""), style="yellow")
+        table.add_row(Text(human_size(n), style=size_color(n)), cell(now), cell(more), where)
+    console.print()
+    console.print(table)
+    if len(rows) > AUDIT_ROWS:
+        console.print(f"[dim]+{len(rows) - AUDIT_ROWS} smaller dir(s) not shown[/]")
+    if blind and partial:
+        console.print(Text.from_markup(
+            f"[yellow]![/] [dim]{human_size(blind)} is not covered by the groups run; skipped:[/] "
+            f"[bold]{', '.join(g for g in ALL_GROUPS if g in partial)}[/][dim]. drop --only/--skip for the full picture.[/]"))
+    elif blind:
+        console.print(Text.from_markup(
+            f"[yellow]![/] [dim]{human_size(blind)} sits in dirs dev-cleaner does not touch. project dirs: add them "
+            f"to[/] [bold]roots[/] [dim](or pass[/] [bold]--root[/][dim]). disposable dirs of your own tools: "
+            f"declare them under[/] [bold]\\[\\[extra]][/] [dim]in the config.[/]"))
 
 
 # ---------------------------------------------------------------------------
@@ -1201,22 +1785,8 @@ def clean_all(items: list[Item], workers: int, roots: list[Path]) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _common_ancestor(paths: list[Path]) -> Path:
-    if not paths:
-        return Path("/")
-    if len(paths) == 1:
-        return paths[0].parent
-    common: list[str] = []
-    for parts in zip(*(p.parts for p in paths)):
-        if len(set(parts)) == 1:
-            common.append(parts[0])
-        else:
-            break
-    return Path(*common) if common else Path("/")
-
-
 def init_wizard(path: Path, scan_root: Path | None = None) -> bool:
-    """Scan ~, cluster projects into parent roots, let the user pick + tune."""
+    """Scan ~, cluster projects by top-level dir, let the user pick + tune."""
     if path.exists():
         if not Confirm.ask(f"  [yellow]{path} exists. overwrite?[/]", default=False):
             return False
@@ -1257,18 +1827,16 @@ def init_wizard(path: Path, scan_root: Path | None = None) -> bool:
     console.print(f"  [green]✓[/] found [bold]{total}[/] project(s) "
                   f"across [bold]{len(groups)}[/] cluster(s) under {tilde(home)}\n")
 
+    # One root per top-level dir, not the tightest common ancestor: a narrow root
+    # stops matching as soon as a sibling project (new clone, worktree) appears.
     suggestions: list[tuple[str, int, list[Path]]] = []
-    for _top, projects in groups.items():
-        root = _common_ancestor(projects)
-        try:
-            root.relative_to(home)
-        except ValueError:
-            root = home
+    for top, projects in groups.items():
+        root = home if top in (".", "(other)") else home / top
         suggestions.append((tilde(root), len(projects), projects))
     suggestions.sort(key=lambda x: -x[1])
 
     selected: list[str] = []
-    console.print("  [bold]include as scan root?[/] [dim](grouped by lowest common ancestor)[/]")
+    console.print("  [bold]include as scan root?[/] [dim](grouped by top-level dir)[/]")
     for label, count, projects in suggestions:
         more = f" [dim](+{count - 1} more)[/]" if count > 1 else ""
         console.print(f"    [dim]example:[/] {tilde(projects[0])}{more}")
@@ -1343,6 +1911,10 @@ def main() -> int:
                    help="Also clean dependency download caches and all unused docker images")
     p.add_argument("--only", metavar="GROUPS", help="Comma-separated groups to run (e.g. rust,docker)")
     p.add_argument("--skip", metavar="GROUPS", help="Comma-separated groups to skip")
+    p.add_argument("--audit", action="store_true",
+                   help="Show the biggest dirs on disk and how much of each would be freed; changes nothing")
+    p.add_argument("--mem", action="store_true",
+                   help="Show which programs hold the memory and how many are orphaned; changes nothing")
     p.add_argument("--list", action="store_true", help="List cleaner groups and exit")
     p.add_argument("--size-jobs", type=int, default=None, help="Parallel sizing workers")
     p.add_argument("--clean-jobs", type=int, default=None, help="Parallel delete workers")
@@ -1388,6 +1960,8 @@ def main() -> int:
     size_jobs = args.size_jobs if args.size_jobs is not None else cfg["size_jobs"]
     clean_jobs = args.clean_jobs if args.clean_jobs is not None else cfg["clean_jobs"]
     aggressive = args.aggressive or bool(cfg.get("aggressive"))
+    volumes = docker_cfg.get("volumes")
+    docker_volumes: bool | str = "all" if volumes == "all" else bool(volumes)
 
     only = _parse_groups(args.only, "--only")
     skip = _parse_groups(args.skip, "--skip") | set(cfg.get("skip") or [])
@@ -1403,6 +1977,19 @@ def main() -> int:
     else:
         age_hours, threshold = cfg["days"] * 24, f"{cfg['days']:g}d"
 
+    now = time.time()
+    sweeps = []
+    for e in cfg.get("extra") or []:
+        if not isinstance(e, dict) or not e.get("path"):
+            console.print(f"[yellow]warning:[/] ignoring \\[\\[extra]] entry without a path: {escape(repr(e))}")
+            continue
+        d = Path(str(e["path"])).expanduser()
+        sweeps.append(Sweep("extra", "idle entries", d, (d,),
+                            cutoff=now - float(e["days"]) * 86400 if "days" in e else None))
+
+    procs_cfg = cfg.get("procs") if isinstance(cfg.get("procs"), dict) else {}
+    orphan_dirs = [Path(str(d)) for d in procs_cfg.get("orphan_dirs") or []]
+
     if args.show_config:
         src = ("legacy rust-clean config" if legacy else "config file") if cfg_path.exists() else "built-in defaults"
         console.print(f"  [dim]source:[/] {src} [dim]({cfg_path})[/]")
@@ -1411,7 +1998,9 @@ def main() -> int:
         console.print(f"  [bold]days[/]        = {age_hours / 24:g}")
         console.print(f"  [bold]aggressive[/]  = {aggressive}")
         console.print(f"  [bold]groups[/]      = {[g for g in ALL_GROUPS if g in groups]}")
-        console.print(f"  [bold]docker.volumes[/] = {bool(docker_cfg.get('volumes'))}")
+        console.print(f"  [bold]docker.volumes[/] = {docker_volumes}")
+        console.print(f"  [bold]extra[/]       = {[tilde(s.path) for s in sweeps]}")
+        console.print(f"  [bold]procs.orphan_dirs[/] = {[str(d) for d in orphan_dirs]}")
         console.print(f"  [bold]size_jobs[/]   = {size_jobs}")
         console.print(f"  [bold]clean_jobs[/]  = {clean_jobs}\n")
         return 0
@@ -1421,13 +2010,24 @@ def main() -> int:
                       f"[dim]to migrate[/]")
 
     ctx = Context(
-        roots=roots, cutoff=time.time() - age_hours * 3600, extra_skip=extra_skip,
+        roots=roots, cutoff=now - age_hours * 3600, extra_skip=extra_skip,
         groups=groups, aggressive=aggressive,
-        docker_volumes=bool(docker_cfg.get("volumes")), size_jobs=size_jobs,
+        docker_volumes=docker_volumes, size_jobs=size_jobs, sweeps=sweeps, orphan_dirs=orphan_dirs,
     )
+    if args.mem:
+        run_mem(ctx)
+        console.print("\n[dim]mem — no changes made.[/]\n")
+        return 0
     items = scan_all(ctx)
     to_clean, active, extra = partition(items, ctx)
     notes = render_notes(active, extra, threshold, ctx.warnings)
+
+    if args.audit:
+        run_audit(ctx, to_clean, active, extra)
+        for n in notes:
+            console.print(n)
+        console.print("\n[dim]audit — no changes made.[/]\n")
+        return 0
 
     if not to_clean:
         console.print("\n[bold green]✨ nothing to clean — you're tidy![/]" if not (active or extra)
@@ -1456,7 +2056,7 @@ def main() -> int:
     free_after = shutil.disk_usage(HOME).free
     freed = max(0, free_after - free_before)
 
-    est = sum(i.size or 0 for i in to_clean)
+    est = sum(i.size or 0 for i in to_clean if not i.ram)
     body = (f"[bold green]✓ cleaned {len(to_clean) - failed}[/]/[bold]{len(to_clean)}[/] item(s)"
             + (f"  ([red]{failed} failed[/])" if failed else "")
             + f"  •  freed [bold green]{human_size(freed)}[/] [dim](estimated {human_size(est)})[/]")

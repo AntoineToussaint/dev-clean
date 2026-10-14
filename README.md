@@ -91,7 +91,13 @@ dev-cleaner --days 7           # only sweep projects idle for 7+ days
 dev-cleaner --hours 2          # anything not touched in the last 2 hours
 dev-cleaner --root ~/code      # scan a specific directory for projects
 dev-cleaner --list             # what each group cleans
+dev-cleaner --audit            # biggest dirs on disk, and how much of each would be freed
+dev-cleaner --mem              # which programs hold the memory, and how many are orphaned
 ```
+
+### Where did my disk go?
+
+`--audit` measures your home dir (and the temp dirs) with `du`, shows every dir over 1 GB down to where the bulk sits, and puts next to each one what a default run and an `--aggressive` run would free there. Anything marked **not covered** is space dev-cleaner can't see: either a project tree outside your `roots`, or a disposable dir of some tool you can declare under `[[extra]]`. It changes nothing, and on a full disk it takes minutes.
 
 ## What gets cleaned
 
@@ -113,13 +119,24 @@ Two tiers. **Default** removes things that are pure derived output: rebuilding t
 | 🟣 dotnet | stale `bin/`, `obj/` | `~/.nuget/packages` |
 | 🏗️ terraform | | `.terraform/` dirs, plugin cache |
 | 🐘 php | | `vendor/`, composer cache |
-| 🐹 go | `go clean -cache` | `go clean -modcache` |
-| 🐳 docker | `docker system prune` (stopped containers, dangling images, unused networks, build cache) | `docker image prune -a` |
+| 🐹 go | `go clean -cache`; gopls, goimports, golangci-lint, staticcheck caches | `go clean -modcache` |
+| 🐳 docker | `docker system prune` (stopped containers, dangling images, unused networks); `docker builder prune -a`; `docker buildx prune` for every local `docker-container` builder (their cache lives in the builder's own container, so `system prune` never sees it); unused volumes if enabled in config | `docker image prune -a` |
 | 🍺 brew | `brew cleanup -s --prune=all` | `brew autoremove` |
 | 🍎 xcode | DerivedData, Xcode cache, CoreSimulator caches, `simctl delete unavailable` | `iOS/watchOS/tvOS/visionOS DeviceSupport` |
-| 🧰 tools | ccache, kubectl discovery cache | playwright / puppeteer / cypress browsers, electron, node-gyp, deno, helm, bazel, JetBrains caches |
+| 🧰 tools | ccache, kubectl discovery cache | playwright / puppeteer / cypress browsers, electron, node-gyp, deno, trivy, helm, bazel, JetBrains caches |
+| 🗑️ tmp | entries of `/tmp` and `$TMPDIR` idle past the threshold; idle Claude Code session scratch (`/tmp/claude-<uid>/…`) | |
+| 📁 extra | idle children of the dirs you list under `[[extra]]` | |
+| 🧟 procs | stops idle orphaned processes (parent gone) that run from a temp dir or a `[procs] orphan_dirs` dir | |
 
-**Never touched:** Docker volumes (opt-in via config, anonymous volumes only), Xcode Archives, rustup toolchains, HuggingFace / Ollama models, your Trash, `~/Library/Caches` in general. Each path is checked against the scan roots, `~` and `/` before deletion.
+**Orphaned processes.** A full disk is often the visible half of the problem; the other half is RAM. Test binaries and tool plugins that outlive a killed parent sit at 0% CPU forever, and a few hundred of them push a machine into swap, where `kernel_task` then burns cores compressing memory. A process is stopped only when it is yours, has been re-parented to init, is older than the idle threshold, uses no CPU, and its executable lives in a temp dir (`go test` binaries, throwaway builds) or in a dir you listed under `[procs] orphan_dirs` (a tool's plugin dir). It gets SIGTERM first so it can tear down its own children, SIGKILL after 8 seconds. Its row shows RAM, which is never added to the disk total.
+
+`--mem` is the read-only view: swap in use, memory by program with how many copies have been idle for over a day, and the orphan count. Dozens of old idle copies of one program (agent sessions, language servers) are sessions nobody closed; dev-cleaner reports those and leaves them to you.
+
+**Temp dirs.** macOS only clears `/tmp` on reboot and `$TMPDIR` after 3 days, and build tools and agents can fill both with gigabytes of throwaway Go caches and checkouts in a day. An entry goes only when it belongs to you, nothing in its top two levels changed within the threshold, and it holds no sockets or pipes (a live program's IPC). `com.apple.*`, `tmux-*`, `ssh-*` and the like are always kept. Each entry is checked again right before it is removed, so one that came back into use since the scan is left alone.
+
+**Docker on macOS.** The images live inside a VM disk image (OrbStack, Docker Desktop, Colima). dev-cleaner reports how much that image holds even when the daemon is down, which is usually because the disk filled up. In that case, free some space, start the daemon and re-run.
+
+**Never touched:** anything across a mount point (`~/OrbStack` is the Docker VM's live filesystem), Docker volumes unless enabled in config, Xcode Archives, rustup toolchains, HuggingFace / Ollama models, your Trash, `~/Library/Caches` in general. Each path is checked against the scan roots, `~` and `/` before deletion.
 
 ### What "stale" means for project dirs
 
@@ -163,9 +180,23 @@ size_jobs = 16   # parallel sizing workers
 clean_jobs = 4   # parallel delete workers (disk bound; keep modest)
 
 [docker]
-# Prune unused anonymous volumes too. Off by default: volumes hold data.
+# Prune unused volumes too. Off by default: volumes hold data.
+# true = anonymous volumes only, "all" = named ones as well.
 volumes = false
+
+[procs]
+# Orphaned processes are stopped when their executable lives in a temp dir.
+# Add dirs whose executables only ever run under a parent (a plugin dir).
+orphan_dirs = ["~/.mytool/plugins"]
+
+# Disposable dirs of your own tools: children idle longer than `days` are
+# removed (`days` defaults to the global one). Repeat the block per dir.
+[[extra]]
+path = "~/Library/Caches/mytool"
+days = 3
 ```
+
+`roots = ["~"]` is a fine default: the walk skips `~/Library`, package-manager homes and mount points, and finding projects is fast. Narrow roots miss every project that lands next to them later (new clones, worktrees).
 
 Check what `dev-cleaner` resolved (file + flags merged):
 
@@ -202,6 +233,8 @@ dev-cleaner --completion fish > ~/.config/fish/completions/dev-cleaner.fish
 | `-a`, `--aggressive` | off | Also clean dependency download caches and all unused docker images. |
 | `--only GROUPS` | all | Comma-separated groups to run. |
 | `--skip GROUPS` | | Comma-separated groups to skip (merged with config). |
+| `--audit` | | Show the biggest dirs and how much of each would be freed; change nothing. |
+| `--mem` | | Show memory by program and the orphaned processes; change nothing. |
 | `--list` | | Show the groups table and exit. |
 | `--size-jobs N` | `16` | Parallel sizing workers (`du -sk`). |
 | `--clean-jobs N` | `4` | Parallel delete workers. |
@@ -215,7 +248,7 @@ dev-cleaner --completion fish > ~/.config/fish/completions/dev-cleaner.fish
 1. Walks each root with `os.walk`, skipping irrelevant dirs and never descending into build dirs or venvs (their `site-packages` are full of fake `pyproject.toml`s).
 2. For every dir holding a project marker (`Cargo.toml`, `package.json`, `go.mod`, `*.csproj`, …) records its sibling build dirs per the rules table.
 3. Measures each top-level project's last source edit in parallel; nested projects inherit it.
-4. Probes the global caches: asks `go env`, `docker system df`, `brew cleanup -n`, `uv cache dir`, `pnpm store path`, and checks a list of known cache paths.
+4. Probes the global caches: asks `go env`, `docker system df`, `docker buildx ls`/`du`, `brew cleanup -n`, `uv cache dir`, `pnpm store path`, checks a list of known cache paths, and lists idle entries in the temp dirs and `[[extra]]` dirs.
 5. Sizes everything with `du -sk` in parallel, dedupes, and shows the grouped table plus a note about what `--aggressive` would add and which active projects were skipped.
 6. On confirm: filesystem deletes run in parallel (read-only trees like Go's modcache are force-chmodded first); external commands (`docker system prune`, `brew cleanup`, `go clean -cache`) run one at a time. The summary reports actual freed disk, not just the estimate.
 
