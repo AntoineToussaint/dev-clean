@@ -495,7 +495,7 @@ def dir_size(path: Path) -> int:
     return total
 
 
-def same_fs(path: Path, dev: int) -> bool:
+def same_fs(path: Path | str, dev: int) -> bool:
     """False across a mount point. ~/OrbStack, for one, is the docker VM's live filesystem."""
     try:
         return os.lstat(path).st_dev == dev
@@ -618,6 +618,7 @@ class Context:
     sweeps: list[Sweep] = field(default_factory=list)  # user-declared, from [[extra]]
     orphan_dirs: list[Path] = field(default_factory=list)  # from [procs], on top of the temp dirs
     warnings: list[str] = field(default_factory=list)
+    measure_active: bool = False     # deep --audit includes sizes of build dirs excluded by activity
 
 
 # ---------------------------------------------------------------------------
@@ -625,7 +626,8 @@ class Context:
 # ---------------------------------------------------------------------------
 
 
-def find_projects(root: Path, extra_skip: set[str] | None = None):
+def find_projects(root: Path, extra_skip: set[str] | None = None, *,
+                  visit: Callable[[Path], None] | None = None):
     """Yield (group, project_dir, build_dir, BuildDir) for every build dir under root."""
     root = root.expanduser().resolve()
     skip = SKIP_DIRS | ALWAYS_PRUNE | (extra_skip or set())
@@ -634,31 +636,35 @@ def find_projects(root: Path, extra_skip: set[str] | None = None):
     except OSError:
         return
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        fset = set(filenames)
         here = Path(dirpath)
+        if visit is not None:
+            visit(here)
         matched: set[str] = set()
-        for rule in RULES:
-            if not rule.matches(fset):
-                continue
-            for bd in rule.dirs:
-                if bd.name not in dirnames or bd.name in matched:
+        if not ALL_BUILD_DIR_NAMES.isdisjoint(dirnames):
+            fset = set(filenames)
+            for rule in RULES:
+                if not rule.matches(fset):
                     continue
-                p = here / bd.name
-                if p.is_symlink() or not p.is_dir():
-                    continue
-                if bd.require and not (p / bd.require).exists():
-                    continue
-                matched.add(bd.name)
-                yield rule.group, here, p, bd
-        dirnames[:] = [d for d in dirnames if d not in skip and d not in matched and same_fs(here / d, dev)]
+                for bd in rule.dirs:
+                    if bd.name not in dirnames or bd.name in matched:
+                        continue
+                    p = here / bd.name
+                    if p.is_symlink() or not p.is_dir():
+                        continue
+                    if bd.require and not (p / bd.require).exists():
+                        continue
+                    matched.add(bd.name)
+                    yield rule.group, here, p, bd
+        dirnames[:] = [d for d in dirnames if d not in skip and d not in matched and same_fs(os.path.join(dirpath, d), dev)]
 
 
-def project_activity(project: Path) -> float:
+def project_activity(project: Path, cutoff: float | None = None) -> float:
     """Latest mtime across a project's sources, ignoring build dirs and VCS.
 
     Proxy for "when was this last worked on". Build-dir mtimes are useless:
     cargo rewrites target/.rustc_info.json on every invocation, node tooling
     touches node_modules/.cache, etc.
+    With a cutoff, stop as soon as one source proves the project is active.
     """
     prune = ALL_BUILD_DIR_NAMES | ALWAYS_PRUNE | {".git", ".hg", ".svn"}
     latest = 0.0
@@ -666,6 +672,8 @@ def project_activity(project: Path) -> float:
         latest = project.stat().st_mtime
     except OSError:
         pass
+    if cutoff is not None and latest >= cutoff:
+        return latest
     dev = os.stat(project).st_dev if project.exists() else 0
     for dirpath, dirnames, filenames in os.walk(project, followlinks=False):
         dirnames[:] = [d for d in dirnames if d not in prune and same_fs(Path(dirpath) / d, dev)]
@@ -674,6 +682,8 @@ def project_activity(project: Path) -> float:
                 m = os.lstat(os.path.join(dirpath, f)).st_mtime
                 if m > latest:
                     latest = m
+                if cutoff is not None and latest >= cutoff:
+                    return latest
             except OSError:
                 continue
     return latest
@@ -687,8 +697,16 @@ def scan_projects(ctx: Context, progress: Progress) -> list[Item]:
             console.print(f"[dim]skip[/] [yellow]{root}[/] (does not exist)")
             continue
         task = progress.add_task(f"scanning {tilde(root)}", detail="", total=None)
-        for group, project, build, bd in find_projects(root, ctx.extra_skip):
-            progress.update(task, detail=tilde(project))
+        visited = 0
+        last_update = 0.0
+        def visit(here: Path) -> None:
+            nonlocal visited, last_update
+            visited += 1
+            now = time.monotonic()
+            if now - last_update >= 0.1:
+                progress.update(task, description=f"scanning {tilde(root)} ({visited:,} dirs)", detail=tilde(here))
+                last_update = now
+        for group, project, build, bd in find_projects(root, ctx.extra_skip, visit=visit):
             if build in seen:
                 continue
             seen.add(build)
@@ -716,7 +734,7 @@ def scan_projects(ctx: Context, progress: Progress) -> list[Item]:
                              detail="", total=len(tops))
     activity: dict[Path, float] = {}
     with ThreadPoolExecutor(max_workers=ctx.size_jobs) as pool:
-        futs = {pool.submit(project_activity, t): t for t in tops}
+        futs = {pool.submit(project_activity, t, ctx.cutoff): t for t in tops}
         for fut in as_completed(futs):
             t = futs[fut]
             activity[t] = fut.result()
@@ -1777,9 +1795,10 @@ def make_progress() -> Progress:
     )
 
 
-def size_items(items: list[Item], workers: int, progress: Progress) -> None:
+def size_items(items: list[Item], workers: int, progress: Progress, cutoff: float | None = None) -> None:
     # Shadowed prune-style items (pnpm/uv prune) stay "?" — the whole dir size would overstate them.
-    todo = [i for i in items if i.size is None and i.path is not None and not i.shadowed]
+    todo = [i for i in items if i.size is None and i.path is not None and not i.shadowed
+            and not (cutoff is not None and i.is_project and i.mtime is not None and i.mtime >= cutoff)]
     if not todo:
         return
     task = progress.add_task(f"sizing {len(todo)} dir(s)", detail="", total=len(todo))
@@ -1826,7 +1845,7 @@ def scan_all(ctx: Context) -> list[Item]:
                 found, warnings = results[index]
                 items += found
                 ctx.warnings.extend(warnings)
-        size_items(items, ctx.size_jobs, progress)
+        size_items(items, ctx.size_jobs, progress, cutoff=None if ctx.measure_active else ctx.cutoff)
 
     # Dedupe by path+label (a `build/` can match jvm and dart in the same dir).
     seen: set[str] = set()
@@ -1955,9 +1974,12 @@ def render_notes(active: list[Item], extra: list[Item], threshold: str, warnings
     if active:
         total = sum(i.size or 0 for i in active)
         projects = {i.project for i in active}
+        measured = sum(i.size is not None for i in active)
+        size_note = (f"holding[/] [{size_color(total)}]{human_size(total)}[/] " if measured == len(active)
+                     else "[dim](sizes skipped; use --audit to measure them)[/] ")
         out.append(Text.from_markup(
             f"[dim]skipped[/] [bold]{len(active)}[/] [dim]build dir(s) in {len(projects)} active project(s) "
-            f"holding[/] [{size_color(total)}]{human_size(total)}[/] "
+            + size_note +
             f"[dim](edited within {threshold}). include them with[/] [bold]--hours N[/]"
         ))
     if extra:
@@ -2405,6 +2427,7 @@ def main() -> int:
         roots=roots, cutoff=now - age_hours * 3600, extra_skip=extra_skip,
         groups=groups, aggressive=aggressive,
         docker_volumes=docker_volumes, size_jobs=size_jobs, sweeps=sweeps, orphan_dirs=orphan_dirs,
+        measure_active=args.audit,
     )
     if args.mem:
         ok = run_mem(ctx, top=args.mem_top or 10, pattern=args.mem_filter or "", by_tree=args.mem_tree,

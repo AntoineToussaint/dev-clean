@@ -133,7 +133,11 @@ The audit changes nothing. Cache pruning means later rebuilds; removing a builde
 
 ### Faster scans, same commands
 
+Use `dev-cleaner --mem` for memory diagnostics: it does not discover projects or size build directories. Plain `dev-cleaner` performs a disk-cleanup scan. Its default root is `~`, so it discovers projects across every checkout and worktree under directories such as `~/.lazybox`; a large worktree forest can take minutes. For a focused disk scan, pass `--root ~/development` or set narrower `roots` in the config.
+
 Global cleaner checks run up to four at a time while project discovery runs. Docker audits read daemon disk usage, container memory and builder inventories concurrently, and measure up to four builder caches at once. The normal Docker scan also measures builder caches concurrently. Results retain their usual order and one failed probe does not hide other groups. Directory sizing still uses `--size-jobs` (default 16).
+
+Project discovery shows a directory count and current path throughout the walk, even where no build directories are found. Activity checks stop as soon as a recent source establishes that a project must be kept. Normal cleanup skips sizing active projects' build directories; `--audit` measures them when you want the full disk breakdown. Stale projects still receive the full activity check before qualifying for cleanup.
 
 This overlaps waits for independent tools without adding setup or flags. A single slow daemon request can still take its timeout. In a controlled benchmark of six simulated 100 ms builder reads, the parallel version took 0.21 seconds versus 0.62 seconds sequentially; actual speedups depend on the tools and workload.
 
