@@ -357,7 +357,12 @@ def _docker_ctx(volumes=False):
 def _docker(monkeypatch, outputs, fail=frozenset()):
     monkeypatch.setattr(dc.shutil, "which", lambda name: "/bin/docker" if name == "docker" else None)
     monkeypatch.setattr(dc, "docker_vm_disks", lambda: [])
-    monkeypatch.setattr(dc, "run", FakeDocker(outputs, set(fail)))
+    local = "unix:///var/run/docker.sock"
+    defaults = {("context", "inspect", "--format", "{{.Endpoints.docker.Host}}"): local,
+                ("context", "inspect", "orbstack", "--format", "{{.Endpoints.docker.Host}}"): local}
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
+    monkeypatch.setattr(dc, "run", FakeDocker({**defaults, **outputs}, set(fail)))
 
 
 def test_scan_docker_covers_build_cache_and_container_builders(monkeypatch):
@@ -484,3 +489,252 @@ def test_stop_action_only_signals_what_still_qualifies(monkeypatch):
     monkeypatch.setattr(dc.os, "kill", fake_kill)
     assert dc._stop_action([a, b], ("/tmp/",), 86400)() == "stopped 1"
     assert sent == [(11, dc.signal.SIGTERM)]
+
+# --- resource diagnostics ----------------------------------------------------
+
+def _memory_text(monkeypatch, procs, **options):
+    from io import StringIO
+    from rich.console import Console
+    monkeypatch.setattr(dc, "system_memory", lambda: {"RAM": 32 * 1024**3, "swap_total": 0, "swap_used": 0})
+    ctx = _docker_ctx()
+    ctx.cutoff = time.time() - 86400
+    output = StringIO()
+    c = Console(file=output, width=180)
+    c.print(dc.render_memory(procs, ctx, **options))
+    return output.getvalue()
+
+
+def test_list_procs_preserves_paths_and_start_identity(monkeypatch):
+    import subprocess
+    monkeypatch.setattr(dc, "IS_MAC", True)
+    monkeypatch.setattr(dc, "_footprints", lambda: {41: 2 * 1024**3})
+    out = ("41 1 501 02-01:20:38 2.5 4096 Wed Oct 21 12:30:00 2026 /Applications/My App/server\n"
+           "42 41 501 00:01 0.0 1024 Sun Oct 25 12:30:00 2026 /usr/bin/worker\n"
+           "malformed line\n")
+    monkeypatch.setattr(dc, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out, ""))
+    a, b = dc.list_procs()
+    assert a.exe == "/Applications/My App/server"
+    assert a.started == "Wed Oct 21 12:30:00 2026"
+    assert a.mem == 2 * 1024**3 and a.footprint
+    assert a.age == 2 * 86400 + 4838 and a.cpu == 2.5
+    assert b.mem == 1024**2 and not b.footprint
+
+
+def test_linux_process_executable_resolution(monkeypatch):
+    import subprocess
+    monkeypatch.setattr(dc, "IS_MAC", False)
+    monkeypatch.setattr(dc.os, "readlink", lambda p: "/opt/my app/server")
+    out = "41 1 501 00:01 0.0 1024 Sun Oct 25 12:30:00 2026 truncated-comm\n"
+    monkeypatch.setattr(dc, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out, ""))
+    [p] = dc.list_procs()
+    assert p.exe == "/opt/my app/server" and not p.footprint
+
+
+def test_group_procs_separates_executables_and_families():
+    procs = [_proc(10, "/opt/a/node", ppid=1), _proc(11, "/opt/a/node", ppid=10),
+             _proc(12, "/opt/b/node", ppid=11), _proc(20, "/opt/a/node", ppid=1),
+             _proc(21, "/usr/bin/root-worker", ppid=10, uid=os.getuid() + 1),
+             _proc(30, "/bin/worker", ppid=999)]
+    programs = {root.exe: {p.pid for p in members} for root, members in dc.group_procs(procs)}
+    assert programs["/opt/a/node"] == {10, 11, 20}
+    assert programs["/opt/b/node"] == {12}
+    families = {root.pid: {p.pid for p in members} for root, members in dc.group_procs(procs, True)}
+    assert families == {10: {10, 11, 12}, 20: {20}, 21: {21}, 30: {30}}
+    # A malformed ancestry cycle and its descendants form one deterministic family.
+    cyclic = [_proc(4, "/a", ppid=5), _proc(5, "/b", ppid=4), _proc(3, "/c", ppid=5)]
+    [(root, members)] = dc.group_procs(cyclic, True)
+    assert root.pid == 4 and {p.pid for p in members} == {3, 4, 5}
+
+
+def test_memory_deltas_ignore_pid_reuse_and_metric_changes():
+    from dataclasses import replace
+    a = replace(_proc(10, "/a", mem=100), started="first")
+    b = replace(_proc(20, "/b", mem=200), started="first")
+    c = replace(_proc(30, "/c", mem=300), started="first")
+    now = [replace(a, mem=150), replace(b, mem=500, started="second"),
+           replace(c, mem=800, footprint=True), _proc(40, "/new")]
+    assert dc.memory_deltas(now, [a, b, c]) == {10: 50}
+
+
+def test_memory_view_includes_small_hogs_and_command_filter(monkeypatch):
+    procs = [_proc(10, "/opt/node", mem=150 * 1024**2), _proc(11, "/opt/node", mem=10 * 1024**2)]
+    out = _memory_text(monkeypatch, procs, commands={10: "node dev.js --port 3000", 11: "node other.js"},
+                       pattern="DEV.JS", full=True)
+    assert "150.0 MB" in out and "dev.js --port 3000" in out
+    assert "1 / 2 processes" in out and "other.js" not in out
+    assert "not reclaimable RAM" in out
+    assert "No processes match" in _memory_text(monkeypatch, procs, pattern="absent")
+
+
+def test_family_filter_preserves_parent_and_counts_orphan_children(monkeypatch):
+    procs = [_proc(10, "/tmp/agent", mem=100 * 1024**2),
+             _proc(11, "/usr/bin/postgres", ppid=10, mem=1024**3)]
+    out = _memory_text(monkeypatch, procs, by_tree=True, pattern="postgres", full=True)
+    assert "/tmp/agent" in out and "root PID" in out
+    assert "with same-owner descendants: 2 processes, 1.1 GB" in out
+    assert "PPID 1 alone" in out and "--only procs --dry-run" in out
+
+
+def test_growth_sort_prefers_growth_over_size(monkeypatch):
+    from dataclasses import replace
+    old = [_proc(10, "/large", mem=3 * 1024**3), _proc(20, "/growing", mem=100 * 1024**2)]
+    now = [replace(old[0], mem=2 * 1024**3), replace(old[1], mem=300 * 1024**2), _proc(30, "/new")]
+    out = _memory_text(monkeypatch, now, previous=old, sort="growth", top=1, full=True, elapsed=5)
+    assert "/growing" in out and "/large" not in out
+    assert "+200.0 MB" in out and "Δ over 5.0s" in out
+
+
+def test_system_memory_mac_and_missing_commands(monkeypatch):
+    import subprocess
+    monkeypatch.setattr(dc, "IS_MAC", True)
+    outputs = {("sysctl", "-n", "hw.memsize"): str(48 * 1024**3),
+               ("vm_stat",): "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages occupied by compressor: 10.\n",
+               ("sysctl", "-n", "vm.swapusage"): "total = 10240.00M  used = 8704.00M  free = 1536.00M"}
+    monkeypatch.setattr(dc, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, outputs[tuple(cmd)], ""))
+    assert dc.system_memory() == {"RAM": 48 * 1024**3, "compressed": 163840,
+                                  "swap_total": 10 * 1024**3, "swap_used": int(8.5 * 1024**3)}
+    monkeypatch.setattr(dc, "run", lambda *a, **kw: None)
+    assert dc.system_memory() == {}
+
+
+def test_system_memory_linux(monkeypatch):
+    monkeypatch.setattr(dc, "IS_MAC", False)
+    monkeypatch.setattr(dc.Path, "read_text", lambda p: "MemTotal: 1000 kB\nMemAvailable: 400 kB\nSwapTotal: 200 kB\nSwapFree: 50 kB\n")
+    assert dc.system_memory() == {"RAM": 1000 * 1024, "available": 400 * 1024,
+                                  "swap_total": 200 * 1024, "swap_used": 150 * 1024}
+
+
+def test_watch_samples_growth_without_cleaning(monkeypatch):
+    from io import StringIO
+    from rich.console import Console
+    monkeypatch.setattr(dc, "console", Console(file=StringIO(), width=120))
+    monkeypatch.setattr(dc, "system_memory", lambda: {})
+    monkeypatch.setattr(dc, "process_commands", lambda: {})
+    samples = iter([[_proc(10, "/a", mem=1024**2)], [_proc(10, "/a", mem=2 * 1024**2)]])
+    monkeypatch.setattr(dc, "list_procs", lambda: next(samples))
+    sleeps = []
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
+            raise KeyboardInterrupt
+    monkeypatch.setattr(dc.time, "sleep", sleep)
+    with pytest.raises(KeyboardInterrupt):
+        dc.run_mem(_docker_ctx(), watch=5, sort="growth")
+    assert sleeps == [5, 5]
+    assert "+1.0 MB" in dc.console.file.getvalue()
+
+
+@pytest.mark.parametrize("args", [
+    ["--mem-watch", "5"], ["--mem", "--mem-top", "0"], ["--mem", "--mem-watch", "nan"],
+    ["--mem", "--mem-watch", "inf"], ["--mem", "--mem-watch", "-1"],
+    ["--mem", "--mem-sort", "growth"], ["--mem", "--docker-audit"],
+])
+def test_invalid_diagnostic_options_fail_before_scanning(monkeypatch, args):
+    monkeypatch.setattr(sys, "argv", ["dev-cleaner", *args])
+    with pytest.raises(SystemExit) as e:
+        dc.main()
+    assert e.value.code == 2
+
+
+def test_docker_audit_deduplicates_builders_and_only_queries_local_running(monkeypatch):
+    from io import StringIO
+    from rich.console import Console
+    builders = [
+        {"Name": "lane", "Driver": "docker-container", "LastActivity": "2026-10-01T00:00:00Z",
+         "Nodes": [{"Endpoint": "orbstack", "Status": "running"}]},
+        {"Name": "down", "Driver": "docker-container", "Nodes": [{"Endpoint": "orbstack", "Status": "stopped"}]},
+        {"Name": "farm", "Driver": "docker-container", "Nodes": [{"Endpoint": "remote-context", "Status": "running"}]},
+    ]
+    _docker(monkeypatch, {
+        ("info", "--format", "{{.MemTotal}}"): str(16 * 1024**3),
+        ("system", "df", "--format", "{{json .}}"): DF,
+        ("stats", "--no-stream", "--format", "{{json .}}"): json.dumps({"Name": "db", "MemUsage": "1GiB / 16GiB", "CPUPerc": "2%"}),
+        ("buildx", "ls", "--format", "{{json .}}"): "\n".join(json.dumps(b) for b in [*builders, builders[0]]),
+        ("buildx", "du", "--builder", "lane"): "Reclaimable:\t7.5GB\n",
+        ("context", "inspect", "remote-context", "--format", "{{.Endpoints.docker.Host}}"): "ssh://remote",
+    })
+    fake, calls = dc.run, []
+    def record(cmd, **kw):
+        calls.append(tuple(cmd[1:]))
+        return fake(cmd, **kw)
+    monkeypatch.setattr(dc, "run", record)
+    output = StringIO()
+    monkeypatch.setattr(dc, "console", Console(file=output, width=200))
+    assert dc.run_docker_audit()
+    assert calls.count(("buildx", "du", "--builder", "lane")) == 1
+    assert not any(c[:2] == ("buildx", "du") and c[-1] != "lane" for c in calls)
+    assert not any(word in ("prune", "rm", "stop", "restart", "kill") for call in calls for word in call)
+    text = output.getvalue()
+    assert "1.0 GB across 1 container" in text
+    assert "7.0 GB" in text and "not running; cache not queried" in text
+    assert "remote or unverified; not queried" in text
+    assert "capacity, not host memory consumption" in text
+
+
+def test_docker_cleanup_skips_remote_context(monkeypatch):
+    _docker(monkeypatch, {("context", "inspect", "--format", "{{.Endpoints.docker.Host}}"): "ssh://remote"})
+    ctx = _docker_ctx()
+    assert dc.scan_docker(ctx) == []
+    assert "remote" in ctx.warnings[0]
+
+
+def test_same_executable_recycled_pid_is_not_stopped(monkeypatch):
+    from dataclasses import replace
+    old = replace(_proc(11, "/tmp/a.test"), started="first")
+    monkeypatch.setattr(dc, "list_procs", lambda: [replace(old, started="second")])
+    def unexpected_signal(*args):
+        pytest.fail("a recycled PID must not be signalled")
+    monkeypatch.setattr(dc.os, "kill", unexpected_signal)
+    assert dc._stop_action([old], ("/tmp/",), 86400)() == "stopped 0"
+
+
+def test_family_filter_keeps_database_descendants(monkeypatch):
+    procs = [_proc(10, "/tmp/codefly-agent", mem=100 * 1024**2),
+             _proc(11, "/usr/bin/postgres", ppid=10, mem=1024**3)]
+    out = _memory_text(monkeypatch, procs, by_tree=True, pattern="codefly", full=True)
+    assert "2 / 2 processes" in out and "/usr/bin/postgres" in out
+    assert "1.1 GB" in out
+
+
+def test_family_stops_at_user_service_manager():
+    procs = [_proc(10, "/usr/lib/systemd/systemd"), _proc(11, "/app/a", ppid=10),
+             _proc(12, "/app/b", ppid=10), _proc(13, "/app/worker", ppid=11)]
+    families = {root.pid: {p.pid for p in members} for root, members in dc.group_procs(procs, True)}
+    assert families == {10: {10}, 11: {11, 13}, 12: {12}}
+
+
+def test_force_kill_does_not_signal_pid_reused_during_grace_period(monkeypatch):
+    from dataclasses import replace
+    old = replace(_proc(11, "/tmp/a.test"), started="first")
+    scans = iter([[old], [replace(old, started="second")]])
+    monkeypatch.setattr(dc, "list_procs", lambda: next(scans))
+    times = iter([0, 9])
+    monkeypatch.setattr(dc.time, "time", lambda: next(times))
+    sent = []
+    monkeypatch.setattr(dc.os, "kill", lambda pid, sig: sent.append((pid, sig)) if sig else None)
+    assert dc._stop_action([old], ("/tmp/",), 86400)() == "stopped 1"
+    assert sent == [(11, dc.signal.SIGTERM)]
+
+
+def test_mem_mode_never_enters_cleanup(monkeypatch, tmp_path):
+    from io import StringIO
+    from rich.console import Console
+    monkeypatch.setattr(dc, "console", Console(file=StringIO()))
+    monkeypatch.setattr(sys, "argv", ["dev-cleaner", "--mem", "--config", str(tmp_path / "none.toml"),
+                                     "--mem-filter", "claude", "--mem-top", "3", "--mem-tree"])
+    options = {}
+    def fake_mem(ctx, **kw):
+        options.update(kw)
+        return True
+    monkeypatch.setattr(dc, "run_mem", fake_mem)
+    monkeypatch.setattr(dc, "scan_all", lambda ctx: pytest.fail("read-only memory mode must not scan cleanup items"))
+    assert dc.main() == 0
+    assert options["pattern"] == "claude" and options["top"] == 3 and options["by_tree"]
+
+
+def test_docker_environment_endpoint_priority(monkeypatch):
+    _docker(monkeypatch, {("context", "inspect", "chosen", "--format", "{{.Endpoints.docker.Host}}"): "unix:///chosen.sock"})
+    monkeypatch.setenv("DOCKER_HOST", "ssh://remote")
+    assert dc.docker_endpoint("docker") == "ssh://remote"
+    monkeypatch.setenv("DOCKER_CONTEXT", "chosen")
+    assert dc.docker_endpoint("docker") == "unix:///chosen.sock"

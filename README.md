@@ -92,12 +92,44 @@ dev-cleaner --hours 2          # anything not touched in the last 2 hours
 dev-cleaner --root ~/code      # scan a specific directory for projects
 dev-cleaner --list             # what each group cleans
 dev-cleaner --audit            # biggest dirs on disk, and how much of each would be freed
-dev-cleaner --mem              # which programs hold the memory, and how many are orphaned
+dev-cleaner --mem              # memory hogs by program, plus PIDs, parents and commands
+dev-cleaner --mem --mem-tree   # combine an app/agent with its child processes
+dev-cleaner --mem --mem-watch 5 --mem-sort growth # watch which processes keep growing
+dev-cleaner --docker-audit     # Docker disk, container memory and individual buildx caches
 ```
 
 ### Where did my disk go?
 
 `--audit` measures your home dir (and the temp dirs) with `du`, shows every dir over 1 GB down to where the bulk sits, and puts next to each one what a default run and an `--aggressive` run would free there. Anything marked **not covered** is space dev-cleaner can't see: either a project tree outside your `roots`, or a disposable dir of some tool you can declare under `[[extra]]`. It changes nothing, and on a full disk it takes minutes.
+
+### Which processes hold my RAM?
+
+`--mem` shows host RAM, compression on macOS, available memory on Linux, swap use, programs ranked by memory, and individual processes with PID, parent PID, CPU, age and command. Programs are grouped by the reported executable, using its full path when available so different installations stay separate. Some processes report only a name; use the command and PID details to distinguish those. Small processes remain visible; there is no 256 MB cutoff.
+
+```bash
+dev-cleaner --mem --mem-top 20                         # more rows in each table
+dev-cleaner --mem --mem-filter claude                  # match PID, executable or command
+dev-cleaner --mem --mem-filter codefly --mem-tree      # matching families, including their descendants
+dev-cleaner --mem --mem-filter postgres --mem-full     # full executable paths and command arguments
+dev-cleaner --mem --mem-sort cpu                       # find CPU-heavy processes
+dev-cleaner --mem --mem-watch 5 --mem-sort growth       # memory changes between snapshots; Ctrl-C to stop
+```
+
+Process families follow same-owner parent links, stopping at init, service managers or a missing parent. With `--mem-tree`, a filter selects whole matching families so a small agent's large database child is included. The largest individual processes still appear in a second table. Commands are shortened to fit the terminal unless you pass `--mem-full`.
+
+Watch mode compares surviving processes with the same PID, start time, executable, owner and memory metric. New processes are marked `new`; exited processes are excluded from growth. Growth sorting becomes useful after the second snapshot. The refresh interval is a delay between scans; the report shows the actual elapsed time. macOS uses `top`'s physical footprint where available and labels RSS fallbacks; Linux uses RSS, which excludes swapped-out pages. Shared pages can appear in multiple processes, so summed memory is an estimate, not the amount stopping them will release.
+
+CPU is the average reported by `ps`. “Old / low CPU” counts processes older than `--days` / `--hours` with CPU at most 1%; it does not prove they have been idle for that duration. Swap use alone also does not establish current memory pressure. Orphan candidates are reported across the full snapshot, along with memory held by their same-owner descendants, and a command to preview cleanup.
+
+### What is Docker holding?
+
+`--docker-audit` reads the local daemon's image/container/volume/build-cache totals, running containers' memory and CPU, and allocated host VM disk size. It also lists each buildx builder once, with driver, node status, last activity when reported, and reclaimable cache for running local container builders. Stopped builders stay stopped; remote or unverified endpoints are skipped. A named Docker context is resolved before deciding whether it is local. Docker cleanup uses the same local-endpoint checks.
+
+Container-builder caches can survive daemon-level cache pruning. Builder estimates are shown separately from daemon and VM disk totals because these views can overlap. Some cache queries can take a while; unavailable measurements display `?`.
+
+The RAM visible to the daemon is capacity, not the VM's host memory consumption. Compare container memory with OrbStack/Docker/Colima processes in `--mem`; the difference also includes guest caches, services and differences in accounting. A large difference alone does not explain slow container starts.
+
+The audit changes nothing. Cache pruning means later rebuilds; removing a builder also removes its configuration. Restarting the runtime interrupts its workloads, and deleting volumes can remove persistent data. Preview the existing cleanup actions with `dev-cleaner --only docker --dry-run`. Space freed inside a VM may take time to return to the host filesystem.
 
 ## What gets cleaned
 
@@ -128,9 +160,7 @@ Two tiers. **Default** removes things that are pure derived output: rebuilding t
 | 📁 extra | idle children of the dirs you list under `[[extra]]` | |
 | 🧟 procs | stops idle orphaned processes (parent gone) that run from a temp dir or a `[procs] orphan_dirs` dir | |
 
-**Orphaned processes.** A full disk is often the visible half of the problem; the other half is RAM. Test binaries and tool plugins that outlive a killed parent sit at 0% CPU forever, and a few hundred of them push a machine into swap, where `kernel_task` then burns cores compressing memory. A process is stopped only when it is yours, has been re-parented to init, is older than the idle threshold, uses no CPU, and its executable lives in a temp dir (`go test` binaries, throwaway builds) or in a dir you listed under `[procs] orphan_dirs` (a tool's plugin dir). It gets SIGTERM first so it can tear down its own children, SIGKILL after 8 seconds. Its row shows RAM, which is never added to the disk total.
-
-`--mem` is the read-only view: swap in use, memory by program with how many copies have been idle for over a day, and the orphan count. Dozens of old idle copies of one program (agent sessions, language servers) are sessions nobody closed; dev-cleaner reports those and leaves them to you.
+**Orphaned processes.** Test binaries and tool plugins can outlive the run that started them and keep holding RAM. A process qualifies for cleanup only when it is yours, has parent PID 1, is older than the configured threshold, has `ps` CPU at most 1%, and its executable lives in a temp dir (`go test` binaries, throwaway builds) or a dir you listed under `[procs] orphan_dirs`. PID 1 alone does not prove a process is abandoned; only list plugin directories whose processes should end with their parent run. Cleanup rechecks the process's executable, owner and start time to avoid signalling a recycled PID. It sends SIGTERM first so a supervisor can tear down its children, then SIGKILL after 8 seconds if it remains. Children are not independently targeted. Its row shows RAM, which is never added to the disk total. Use `--mem` to investigate and `--only procs --dry-run` to preview candidates.
 
 **Temp dirs.** macOS only clears `/tmp` on reboot and `$TMPDIR` after 3 days, and build tools and agents can fill both with gigabytes of throwaway Go caches and checkouts in a day. An entry goes only when it belongs to you, nothing in its top two levels changed within the threshold, and it holds no sockets or pipes (a live program's IPC). `com.apple.*`, `tmux-*`, `ssh-*` and the like are always kept. Each entry is checked again right before it is removed, so one that came back into use since the scan is left alone.
 
@@ -234,7 +264,14 @@ dev-cleaner --completion fish > ~/.config/fish/completions/dev-cleaner.fish
 | `--only GROUPS` | all | Comma-separated groups to run. |
 | `--skip GROUPS` | | Comma-separated groups to skip (merged with config). |
 | `--audit` | | Show the biggest dirs and how much of each would be freed; change nothing. |
-| `--mem` | | Show memory by program and the orphaned processes; change nothing. |
+| `--docker-audit` | | Read-only Docker disk, container memory and per-builder cache inventory. |
+| `--mem` | | Read-only host memory, programs, individual PIDs and orphan candidates. |
+| `--mem-top N` | `10` | Rows per memory table; requires `--mem`. |
+| `--mem-filter TEXT` | | Case-insensitive match on PID, executable or command. With `--mem-tree`, selects whole matching families. |
+| `--mem-tree` | off | Group memory by process family; requires `--mem`. |
+| `--mem-full` | off | Wrap full paths and commands instead of shortening them; requires `--mem`. |
+| `--mem-sort {memory,cpu,growth}` | `memory` | Sort both memory tables. Growth requires `--mem-watch`. |
+| `--mem-watch SECONDS` | | Refresh memory, showing deltas since the previous snapshot; requires `--mem`. Ctrl-C stops. |
 | `--list` | | Show the groups table and exit. |
 | `--size-jobs N` | `16` | Parallel sizing workers (`du -sk`). |
 | `--clean-jobs N` | `4` | Parallel delete workers. |
