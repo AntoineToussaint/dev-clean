@@ -827,3 +827,54 @@ def test_parallel_scanner_failure_does_not_hide_other_results(monkeypatch):
     ctx.groups = {"docker"}
     assert [item.label for item in dc.scan_all(ctx)] == ["cache"]
     assert ctx.warnings == ["docker: scan failed (tool failed) — skipped"]
+
+
+def test_activity_check_returns_without_walking_known_active_project(tmp_path, monkeypatch):
+    project = mk(tmp_path, "active", files={"Cargo.toml": ""})
+    monkeypatch.setattr(dc.os, "walk", lambda *a, **kw: pytest.fail("an active directory does not need a source walk"))
+    assert dc.project_activity(project, time.time() - 86400) >= time.time() - 86400
+
+
+def test_activity_check_stops_after_first_recent_source(tmp_path, monkeypatch):
+    project = mk(tmp_path, "active", files={"old.rs": "", "recent.rs": ""})
+    old = time.time() - 30 * 86400
+    os.utime(project / "old.rs", (old, old))
+    os.utime(project, (old, old))
+    def walk(*args, **kw):
+        yield str(project), [], ["old.rs", "recent.rs"]
+        pytest.fail("one recent source already establishes that the project is active")
+    monkeypatch.setattr(dc.os, "walk", walk)
+    assert dc.project_activity(project, time.time() - 86400) >= time.time() - 86400
+
+
+def test_default_sizing_skips_active_builds_but_audit_can_measure_them(tmp_path, monkeypatch):
+    cutoff = time.time() - 86400
+    items = [dc.Item("node", "node_modules/", tmp_path / "active", project=tmp_path / "p", mtime=time.time()),
+             dc.Item("rust", "target/", tmp_path / "stale", project=tmp_path / "q", mtime=cutoff - 1)]
+    measured = []
+    def size(path):
+        measured.append(path)
+        return 123
+    monkeypatch.setattr(dc, "dir_size", size)
+    with dc.make_progress() as progress:
+        dc.size_items(items, 2, progress, cutoff=cutoff)
+    assert measured == [tmp_path / "stale"]
+    assert items[0].size is None and items[1].size == 123
+    with dc.make_progress() as progress:
+        dc.size_items(items, 2, progress)
+    assert measured == [tmp_path / "stale", tmp_path / "active"]
+    assert items[0].size == 123
+
+
+def test_skipped_active_sizes_are_labelled_unmeasured():
+    item = dc.Item("node", "node_modules/", Path("/p/node_modules"), project=Path("/p"))
+    [note] = dc.render_notes([item], [], "1d", [])
+    assert "sizes skipped; use --audit" in note.plain
+    assert "holding" not in note.plain
+
+
+def test_discovery_reports_progress_without_waiting_for_project_matches(tmp_path):
+    mk(tmp_path, "empty", "nested", files={"source.txt": ""})
+    visited = []
+    assert list(dc.find_projects(tmp_path, visit=visited.append)) == []
+    assert set(visited) == {tmp_path, tmp_path / "empty", tmp_path / "empty/nested"}
