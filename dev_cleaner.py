@@ -27,7 +27,7 @@ import time
 import tomllib
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
@@ -56,6 +56,7 @@ MAC_CACHES = HOME / "Library" / "Caches"
 
 SAFE = "safe"
 AGGRESSIVE = "aggressive"
+PROBE_JOBS = 4                      # cap concurrent tool probes separately from disk sizing
 
 # ---------------------------------------------------------------------------
 # Scanning rules
@@ -935,6 +936,19 @@ def _buildx_reclaimable(docker: str, builder: str) -> int | None:
     return parse_size(m.group(1)) if m else None
 
 
+def _builder_cache_sizes(docker: str, names: list[str]) -> dict[str, int | None]:
+    with ThreadPoolExecutor(max_workers=PROBE_JOBS) as pool:
+        return dict(zip(names, pool.map(lambda name: _buildx_reclaimable(docker, name), names)))
+
+
+def _builder_inventory(docker: str) -> tuple[list[dict], dict[str, bool], dict[str, int | None]]:
+    builders = _buildx_builders(docker)
+    local = {b["Name"]: _builder_is_local(docker, b) for b in builders if b.get("Driver") == "docker-container"}
+    running = [b["Name"] for b in builders if local.get(b["Name"]) and
+               any(n.get("Status") == "running" for n in b.get("Nodes") or [] if isinstance(n, dict))]
+    return builders, local, _builder_cache_sizes(docker, running)
+
+
 def scan_docker(ctx: Context) -> list[Item]:
     docker = shutil.which("docker")
     if not docker:
@@ -988,8 +1002,8 @@ def scan_docker(ctx: Context) -> list[Item]:
             cache = _buildx_reclaimable(docker, ctxname.stdout.strip())
     prune("docker builder prune -a", cache, SAFE, "build cache; rebuilt on demand",
           "builder", "prune", "-a", "-f")
-    for name in _container_builders(docker):
-        prune(f"docker buildx prune ({name})", _buildx_reclaimable(docker, name), SAFE,
+    for name, size in _builder_cache_sizes(docker, _container_builders(docker)).items():
+        prune(f"docker buildx prune ({name})", size, SAFE,
               "build cache of a container builder; rebuilt on demand",
               "buildx", "prune", "--builder", name, "-a", "-f")
 
@@ -1034,8 +1048,25 @@ def run_docker_audit() -> bool:
         console.print(Text(f"RAM visible to the Docker daemon: {human_size(int(info.stdout.strip()))} "
                            "(capacity, not host memory consumption)"))
 
-    with console.status("Reading Docker disk accounting (may take up to a minute)…"):
-        df = _docker_df(docker)
+    # The daemon's disk accounting and each builder may be slow independently.
+    # Keep rendering on this thread and overlap only read-only probes.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        pending = {pool.submit(_docker_df, docker): "disk usage",
+                   pool.submit(run, [docker, "stats", "--no-stream", "--format", "{{json .}}"], timeout=20): "container memory",
+                   pool.submit(_builder_inventory, docker): "builder caches"}
+        results = {}
+        with console.status("Reading Docker disk, memory and builder caches in parallel…") as status:
+            for future in as_completed(pending):
+                name = pending[future]
+                try:
+                    results[name] = future.result()
+                except Exception:
+                    results[name] = None
+                remaining = [label for label in pending.values() if label not in results]
+                status.update("Waiting for " + ", ".join(remaining) + "…")
+    df = results["disk usage"] or {}
+    stats = results["container memory"]
+    builders, local, caches = results["builder caches"] or ([], {}, {})
     table = Table(title="🐳  Docker disk usage (daemon)", box=ROUNDED, title_justify="left", expand=True)
     for label in ("resource", "total", "active", "size", "reclaimable"):
         table.add_column(label)
@@ -1046,8 +1077,6 @@ def run_docker_audit() -> bool:
     if not df:
         console.print("[yellow]Daemon disk usage unavailable; builder caches may still be measurable.[/]")
 
-    with console.status("Reading running container memory…"):
-        stats = run([docker, "stats", "--no-stream", "--format", "{{json .}}"], timeout=20)
     containers = []
     if stats and stats.returncode == 0:
         for line in stats.stdout.splitlines():
@@ -1072,8 +1101,6 @@ def run_docker_audit() -> bool:
     console.print(Text("Container stats and host VM footprint use different accounting; their difference is not all VM overhead. "
                        "Guest caches and services also use memory.", style="dim"))
 
-    with console.status("Reading buildx inventory…"):
-        builders = _buildx_builders(docker)
     table = Table(title="🏗️  buildx builders and container-builder caches", box=ROUNDED,
                   title_justify="left", expand=True)
     for label in ("builder", "driver / status", "last activity", "reclaimable", "endpoint / notes"):
@@ -1088,13 +1115,12 @@ def run_docker_audit() -> bool:
         cache = None
         if driver != "docker-container":
             note = "daemon-managed cache; inspect its context" if driver == "docker" else "not a container builder"
-        elif not _builder_is_local(docker, builder):
+        elif not local.get(name):
             note = "remote or unverified; not queried"
         elif not any(n.get("Status") == "running" for n in nodes):
             note = "not running; cache not queried"
         else:
-            with console.status(Text(f"Measuring cache for builder {name}…")):
-                cache = _buildx_reclaimable(docker, name)
+            cache = caches.get(name)
             note = "cache rebuilt on demand" if cache is not None else "cache query unavailable"
         if cache is not None:
             measured.append(cache)
@@ -1772,19 +1798,34 @@ def size_items(items: list[Item], workers: int, progress: Progress) -> None:
 
 def scan_all(ctx: Context) -> list[Item]:
     items: list[Item] = []
+
+    def probe(name: str, fn: Callable[[Context], list[Item]]) -> tuple[list[Item], list[str]]:
+        # Keep warning buffers private; merge results in the familiar group order.
+        local_ctx = replace(ctx, warnings=[])
+        try:
+            found = fn(local_ctx)
+        except Exception as e:  # one broken tool must not sink the run
+            found = []
+            local_ctx.warnings.append(f"{name}: scan failed ({e}) — skipped")
+        return found, local_ctx.warnings
+
     with make_progress() as progress:
-        if ctx.groups & set(PROJECT_GROUPS):
-            items += scan_projects(ctx, progress)
-        for name, fn in GLOBAL_SCANNERS.items():
-            if name not in ctx.groups:
-                continue
-            task = progress.add_task(f"checking {name}", detail="", total=None)
-            try:
-                items += fn(ctx)
-            except Exception as e:  # one broken tool must not sink the run
-                ctx.warnings.append(f"{name}: scan failed ({e}) — skipped")
-            progress.remove_task(task)
-        items += scan_known_caches(ctx)
+        probes = [(name, fn) for name, fn in GLOBAL_SCANNERS.items() if name in ctx.groups]
+        probes.append(("known caches", scan_known_caches))
+        with ThreadPoolExecutor(max_workers=PROBE_JOBS) as pool:
+            pending = {pool.submit(probe, name, fn): (index, progress.add_task(
+                f"checking {name}", detail="", total=None)) for index, (name, fn) in enumerate(probes)}
+            if ctx.groups & set(PROJECT_GROUPS):
+                items += scan_projects(ctx, progress)
+            results = {}
+            for future in as_completed(pending):
+                index, task = pending[future]
+                results[index] = future.result()
+                progress.remove_task(task)
+            for index in range(len(probes)):
+                found, warnings = results[index]
+                items += found
+                ctx.warnings.extend(warnings)
         size_items(items, ctx.size_jobs, progress)
 
     # Dedupe by path+label (a `build/` can match jvm and dart in the same dir).

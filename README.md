@@ -131,6 +131,12 @@ The RAM visible to the daemon is capacity, not the VM's host memory consumption.
 
 The audit changes nothing. Cache pruning means later rebuilds; removing a builder also removes its configuration. Restarting the runtime interrupts its workloads, and deleting volumes can remove persistent data. Preview the existing cleanup actions with `dev-cleaner --only docker --dry-run`. Space freed inside a VM may take time to return to the host filesystem.
 
+### Faster scans, same commands
+
+Global cleaner checks run up to four at a time while project discovery runs. Docker audits read daemon disk usage, container memory and builder inventories concurrently, and measure up to four builder caches at once. The normal Docker scan also measures builder caches concurrently. Results retain their usual order and one failed probe does not hide other groups. Directory sizing still uses `--size-jobs` (default 16).
+
+This overlaps waits for independent tools without adding setup or flags. A single slow daemon request can still take its timeout. In a controlled benchmark of six simulated 100 ms builder reads, the parallel version took 0.21 seconds versus 0.62 seconds sequentially; actual speedups depend on the tools and workload.
+
 ## What gets cleaned
 
 Two tiers. **Default** removes things that are pure derived output: rebuilding them costs CPU, not network. **`--aggressive`** adds dependency *download* caches (re-fetched on the next build) and every Docker image not used by a container. The default run always tells you how much more `--aggressive` would free, so nothing is hidden.

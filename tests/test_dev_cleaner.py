@@ -738,3 +738,92 @@ def test_docker_environment_endpoint_priority(monkeypatch):
     assert dc.docker_endpoint("docker") == "ssh://remote"
     monkeypatch.setenv("DOCKER_CONTEXT", "chosen")
     assert dc.docker_endpoint("docker") == "unix:///chosen.sock"
+
+
+# --- concurrent read-only probes --------------------------------------------
+
+def test_builder_cache_queries_are_bounded_and_concurrent(monkeypatch):
+    import threading
+    barrier = threading.Barrier(dc.PROBE_JOBS, timeout=5)
+    lock = threading.Lock()
+    active, peak = 0, 0
+    names = [f"builder-{i}" for i in range(dc.PROBE_JOBS * 2)]
+    def measure(docker, name):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            barrier.wait()  # succeeds only if the worker cap is filled concurrently
+            return names.index(name)
+        finally:
+            with lock:
+                active -= 1
+    monkeypatch.setattr(dc, "_buildx_reclaimable", measure)
+    assert dc._builder_cache_sizes("docker", names) == dict(zip(names, range(len(names))))
+    assert peak == dc.PROBE_JOBS
+
+
+def test_docker_audit_overlaps_disk_stats_and_builder_inventory(monkeypatch):
+    import subprocess
+    import threading
+    from io import StringIO
+    from rich.console import Console
+    _docker(monkeypatch, {("info", "--format", "{{.MemTotal}}"): str(16 * 1024**3)})
+    monkeypatch.setattr(dc, "console", Console(file=StringIO()))
+    barrier = threading.Barrier(3, timeout=5)
+    completed = []
+    def disk(docker):
+        barrier.wait()
+        completed.append("disk")
+        return {}
+    def builders(docker):
+        barrier.wait()
+        completed.append("builders")
+        return [], {}, {}
+    fake = dc.run
+    def run(cmd, **kw):
+        if cmd[1] == "stats":
+            barrier.wait()
+            completed.append("memory")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        return fake(cmd, **kw)
+    monkeypatch.setattr(dc, "_docker_df", disk)
+    monkeypatch.setattr(dc, "_builder_inventory", builders)
+    monkeypatch.setattr(dc, "run", run)
+    assert dc.run_docker_audit()
+    assert set(completed) == {"disk", "builders", "memory"}
+
+
+def test_global_scans_overlap_projects_and_keep_result_order(monkeypatch):
+    import threading
+    barrier = threading.Barrier(4, timeout=5)
+    def scanner(name):
+        def scan(ctx):
+            ctx.warnings.append(name)
+            barrier.wait()
+            return [dc.Item("rust", name, size=1)]
+        return scan
+    def projects(ctx, progress):
+        barrier.wait()
+        return [dc.Item("rust", "projects", size=1)]
+    monkeypatch.setattr(dc, "GLOBAL_SCANNERS", {"rust": scanner("rust"), "docker": scanner("docker")})
+    monkeypatch.setattr(dc, "scan_known_caches", scanner("caches"))
+    monkeypatch.setattr(dc, "scan_projects", projects)
+    ctx = _docker_ctx()
+    ctx.groups = {"rust", "docker"}
+    ctx.warnings = ["existing"]
+    items = dc.scan_all(ctx)
+    assert [item.label for item in items] == ["projects", "rust", "docker", "caches"]
+    assert ctx.warnings == ["existing", "rust", "docker", "caches"]
+
+
+def test_parallel_scanner_failure_does_not_hide_other_results(monkeypatch):
+    def broken(ctx):
+        raise RuntimeError("tool failed")
+    monkeypatch.setattr(dc, "GLOBAL_SCANNERS", {"docker": broken})
+    monkeypatch.setattr(dc, "scan_known_caches", lambda ctx: [dc.Item("tools", "cache", size=1)])
+    ctx = _docker_ctx()
+    ctx.groups = {"docker"}
+    assert [item.label for item in dc.scan_all(ctx)] == ["cache"]
+    assert ctx.warnings == ["docker: scan failed (tool failed) — skipped"]
