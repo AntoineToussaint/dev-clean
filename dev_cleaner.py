@@ -35,15 +35,13 @@ from typing import Callable
 
 from rich.box import ROUNDED
 from rich.console import Console, Group
+from rich.live import Live
 from rich.markup import escape
 from rich.panel import Panel
 from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
     Progress,
     SpinnerColumn,
     TextColumn,
-    TimeElapsedColumn,
 )
 from rich.prompt import Confirm, FloatPrompt, Prompt
 from rich.table import Table
@@ -342,7 +340,7 @@ _dev_cleaner() {{
     COMPREPLY=()
     cur="${{COMP_WORDS[COMP_CWORD]}}"
     prev="${{COMP_WORDS[COMP_CWORD-1]}}"
-    opts="--root --days --hours --dry-run --yes --aggressive --only --skip --audit --docker-audit --mem --mem-top --mem-filter --mem-tree --mem-full --mem-sort --mem-watch --list --size-jobs --clean-jobs --command-timeout --config --init --show-config --completion -n -y -a -h --help"
+    opts="--root --days --hours --dry-run --yes --aggressive --only --skip --audit --docker-audit --mem --mem-top --mem-filter --mem-tree --mem-full --mem-sort --mem-watch --list --sizes --size-jobs --clean-jobs --command-timeout --config --init --show-config --completion -n -y -a -h --help"
     case "$prev" in
         --root|--config) COMPREPLY=( $(compgen -f -- "$cur") ); return ;;
         --completion) COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ); return ;;
@@ -378,6 +376,7 @@ _dev_cleaner() {{
         '--mem-sort[Sort memory tables]:sort:(memory cpu growth)' \
         '--mem-watch[Refresh memory and show growth]:seconds:' \
         '--list[List cleaner groups and exit]' \
+        '--sizes[Measure directory and Docker cache sizes (slower)]' \
         '--size-jobs[Parallel sizing workers]:N:' \
         '--clean-jobs[Parallel cleanup workers]:N:' \
         '--command-timeout[Cleanup command time limit]:seconds:' \
@@ -409,6 +408,7 @@ complete -c dev-cleaner -l mem-full -d "Show full paths and commands"
 complete -c dev-cleaner -l mem-sort -d "Sort memory tables" -x -a "memory cpu growth"
 complete -c dev-cleaner -l mem-watch -d "Refresh memory and show growth" -x
 complete -c dev-cleaner -l list -d "List cleaner groups and exit"
+complete -c dev-cleaner -l sizes -d "Measure directory and Docker cache sizes (slower)"
 complete -c dev-cleaner -l size-jobs -d "Parallel sizing workers" -x
 complete -c dev-cleaner -l clean-jobs -d "Parallel cleanup workers" -x
 complete -c dev-cleaner -l command-timeout -d "Cleanup command time limit in seconds" -x
@@ -484,17 +484,21 @@ def run(cmd: list[str], timeout: float = 60, **kw) -> subprocess.CompletedProces
         return None
 
 
-def dir_size(path: Path) -> int:
+def dir_size(path: Path) -> int | None:
     """Disk usage in bytes. Uses `du -sk` (fast, counts blocks) when available."""
     if shutil.which("du"):
-        r = run(["du", "-sk", str(path)], timeout=600)
+        r = run(["du", "-sk", str(path)], timeout=30)
         if r is not None and r.stdout.strip():
             try:
                 return int(r.stdout.split()[0]) * 1024
             except ValueError:
                 pass
+        return None  # Do not restart a timed-out du as an unbounded Python walk.
     total = 0
+    deadline = time.monotonic() + 30
     for dirpath, _, filenames in os.walk(path, followlinks=False):
+        if time.monotonic() >= deadline:
+            return None
         for f in filenames:
             try:
                 total += os.lstat(os.path.join(dirpath, f)).st_size
@@ -514,11 +518,11 @@ def same_fs(path: Path | str, dev: int) -> bool:
 def paths_size(paths: list[Path], workers: int) -> dict[Path, int]:
     """Disk usage of many paths at once: a few batched `du` calls instead of one each."""
     if not shutil.which("du"):
-        return {p: dir_size(p) for p in paths}
+        return {p: n for p in paths if (n := dir_size(p)) is not None}
 
     def batch(chunk: list[Path]) -> dict[Path, int]:
         out: dict[Path, int] = {}
-        r = run(["du", "-sk", *map(str, chunk)], timeout=1800)
+        r = run(["du", "-sk", *map(str, chunk)], timeout=30)
         for line in (r.stdout.splitlines() if r else ()):
             kb, _, name = line.partition("\t")
             if kb.isdigit():
@@ -646,6 +650,7 @@ class Context:
     warnings: list[str] = field(default_factory=list)
     measure_active: bool = False     # deep --audit includes sizes of build dirs excluded by activity
     command_timeout: float = 60
+    measure_sizes: bool = False      # recursive size reads are opt-in, never needed to clean
 
 
 # ---------------------------------------------------------------------------
@@ -1038,15 +1043,15 @@ def scan_docker(ctx: Context) -> list[Item]:
     if held:
         ctx.warnings.append(f"docker: {held} — cleanup inside the VM may not immediately shrink the host file")
 
-    df = _docker_df(docker)
-    if not df:
+    df = _docker_df(docker) if ctx.measure_sizes else {}
+    if ctx.measure_sizes and not df:
         ctx.warnings.append("docker: `docker system df` failed — some sizes unknown")
 
     def reclaimable(t: str) -> int | None:
         return parse_size(df[t]["Reclaimable"]) if t in df else None
 
     dangling = None
-    r = run([docker, "images", "-f", "dangling=true", "--format", "{{.Size}}"], timeout=30)
+    r = run([docker, "images", "-f", "dangling=true", "--format", "{{.Size}}"], timeout=30) if ctx.measure_sizes else None
     if r and r.returncode == 0:
         dangling = sum(parse_size(l) or 0 for l in r.stdout.splitlines() if l.strip())
 
@@ -1068,13 +1073,15 @@ def scan_docker(ctx: Context) -> list[Item]:
           "stopped containers, dangling images, unused networks", "system", "prune", "-f")
 
     cache = reclaimable("Build Cache")
-    if cache is None:
+    if cache is None and ctx.measure_sizes:
         ctxname = run([docker, "context", "show"], timeout=15)
         if ctxname and ctxname.returncode == 0 and ctxname.stdout.strip():
             cache = _buildx_reclaimable(docker, ctxname.stdout.strip())
     prune("docker builder prune -a", cache, SAFE, "build cache; rebuilt on demand",
           "builder", "prune", "-a", "-f")
-    for name, size in _builder_cache_sizes(docker, _container_builders(docker)).items():
+    builders = _container_builders(docker)
+    caches = _builder_cache_sizes(docker, builders) if ctx.measure_sizes else dict.fromkeys(builders)
+    for name, size in caches.items():
         prune(f"docker buildx prune ({name})", size, SAFE,
               "build cache of a container builder; rebuilt on demand",
               "buildx", "prune", "--builder", name, "-a", "-f")
@@ -1412,12 +1419,13 @@ def scan_sweeps(sweeps: list[Sweep], ctx: Context) -> list[Item]:
                     stale.append(p)
         if not stale:
             continue
-        sizes = paths_size(stale, ctx.size_jobs)
+        sizes = paths_size(stale, ctx.size_jobs) if ctx.measure_sizes else {}
         top = sorted(sizes.items(), key=lambda kv: -kv[1])[:3]
         note = f"{len(stale)} entries" + (
             "; biggest: " + ", ".join(f"{p.name[:28]} {human_size(n)}" for p, n in top) if top else "")
         items.append(Item(
-            group=sw.group, label=sw.label, path=sw.path, size=sum(sizes.values()), tier=SAFE,
+            group=sw.group, label=sw.label, path=sw.path,
+            size=sum(sizes.values()) if len(sizes) == len(stale) else None, tier=SAFE,
             note=f"{sw.note}; {note}" if sw.note else note, mode="action",
             action=_sweep_action(stale, cutoff),
         ))
@@ -1838,20 +1846,53 @@ GROUP_HELP: dict[str, tuple[str, str]] = {
 # ---------------------------------------------------------------------------
 
 
+def _status_table() -> Table:
+    """One physical terminal line per row, even with very long paths/errors."""
+    table = Table.grid(expand=True, padding=(0, 1))
+    table.add_column(width=11, no_wrap=True, overflow="ellipsis")
+    table.add_column(width=10, no_wrap=True, overflow="ellipsis")
+    table.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+    return table
+
+
+def _elapsed(seconds: float) -> str:
+    minutes, seconds = divmod(max(0, int(seconds)), 60)
+    return f"{minutes}:{seconds:02d}"
+
+
+class ScanProgress(Progress):
+    """Keep discovery, tool checks and sizing anchored to three reserved rows."""
+
+    def get_renderables(self):
+        buckets = {name: [] for name in ("Projects", "Tools", "Sizes")}
+        for task in self.tasks:
+            category = ("Tools" if task.description.startswith("checking ") else
+                        "Sizes" if task.description.startswith("sizing ") else "Projects")
+            buckets[category].append(task)
+        table = _status_table()
+        for category, tasks in buckets.items():
+            if not tasks:
+                table.add_row(Text(category, style="bold"), Text("—", style="dim"), Text("", style="dim"))
+                continue
+            elapsed = max(task.elapsed or 0 for task in tasks)
+            if category == "Tools":
+                label = ", ".join(task.description.removeprefix("checking ") for task in tasks)
+            else:
+                task = tasks[-1]
+                count = f" {int(task.completed)}/{int(task.total)}" if task.total is not None else ""
+                label = f"{task.description}{count}  {task.fields.get('detail', '')}"
+            table.add_row(Text(category, style="bold"), Text(_elapsed(elapsed), style="dim"), Text(label))
+        yield table
+
+
 def make_progress() -> Progress:
-    return Progress(
-        SpinnerColumn(style="magenta"),
-        TextColumn("[bold]{task.description}"),
-        TextColumn("[dim]{task.fields[detail]}"),
-        TimeElapsedColumn(),
-        console=console,
-        transient=True,
-    )
+    return ScanProgress(console=console, transient=True, refresh_per_second=4, disable=not console.is_terminal)
 
 
 def size_items(items: list[Item], workers: int, progress: Progress, cutoff: float | None = None) -> None:
     # Shadowed prune-style items (pnpm/uv prune) stay "?" — the whole dir size would overstate them.
     todo = [i for i in items if i.size is None and i.path is not None and not i.shadowed
+            and i.group not in {"tmp", "extra"}  # sweeps measure selected entries, not their whole parent
             and not (cutoff is not None and i.is_project and i.mtime is not None and i.mtime >= cutoff)]
     if not todo:
         return
@@ -1899,7 +1940,8 @@ def scan_all(ctx: Context) -> list[Item]:
                 found, warnings = results[index]
                 items += found
                 ctx.warnings.extend(warnings)
-        size_items(items, ctx.size_jobs, progress, cutoff=None if ctx.measure_active else ctx.cutoff)
+        if ctx.measure_sizes:
+            size_items(items, ctx.size_jobs, progress, cutoff=None if ctx.measure_active else ctx.cutoff)
 
     # Dedupe by path+label (a `build/` can match jvm and dart in the same dir).
     seen: set[str] = set()
@@ -2014,10 +2056,11 @@ def render_table(items: list[Item], threshold: str, aggressive: bool) -> Table:
             table.add_row(str(n), size, age, what)
 
     total = sum(i.size or 0 for i in items if not i.ram)
-    unknown = sum(1 for i in items if i.size is None)
+    unknown = sum(1 for i in items if i.size is None and not i.ram)
     table.add_section()
     table.add_row(
-        "", Text(human_size(total) + ("+" if unknown else ""), style="bold green"), "",
+        "", Text((human_size(total) + "+" if total else "not measured") if unknown else human_size(total),
+                 style="bold green"), "",
         Text(f"{len(items)} item(s) — reclaimable", style="bold green"),
     )
     return table
@@ -2038,12 +2081,12 @@ def render_notes(active: list[Item], extra: list[Item], threshold: str, warnings
         ))
     if extra:
         total = sum(i.size or 0 for i in extra)
-        top = ", ".join(f"{i.label} {human_size(i.size)}" for i in extra[:4] if i.size)
+        top = ", ".join(i.label + (f" {human_size(i.size)}" if i.size is not None else "") for i in extra[:4])
         more = f", +{len(extra) - 4} more" if len(extra) > 4 else ""
-        out.append(Text.from_markup(
-            f"[dim]another[/] [{size_color(total)}]{human_size(total)}[/] [dim]in {len(extra)} dependency "
-            f"cache(s) / unused image(s) with[/] [bold]--aggressive[/][dim]: {top}{more}[/]"
-        ))
+        space = human_size(total) if all(i.size is not None for i in extra) else "unmeasured space"
+        out.append(Text(f"{space} in {len(extra)} dependency cache(s) / unused image(s) with --aggressive: "
+                        f"{top}{more}", style="dim"))
+
     for w in warnings:
         out.append(Text.from_markup(f"[yellow]![/] [dim]{escape(w)}[/]"))
     return out
@@ -2204,27 +2247,31 @@ def _delete(item: Item, roots: list[Path], cancelled: Event | None = None
 def clean_all(items: list[Item], workers: int, roots: list[Path]) -> CleanupReport:
     result = CleanupReport()
     cancelled = Event()
-    progress = Progress(
-        SpinnerColumn(style="green"),
-        TextColumn("[bold]cleaning[/] [dim]{task.fields[detail]}[/]"),
-        BarColumn(complete_style="green", finished_style="bold green"),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        console=console,
-    )
+    started = time.monotonic()
+    slot_count = min(max(1, workers), len(items))
+    slots = [("waiting", "", None, None) for _ in range(slot_count)]
+    outcomes = {}
+
+    def render():
+        completed = result.cleaned + result.deferred + result.failed
+        heading = Text(f"Cleaning {completed}/{len(items)}  ·  {result.cleaned} done  ·  "
+                       f"{result.deferred} incomplete  ·  {result.failed} failed  ·  "
+                       f"{_elapsed(time.monotonic() - started)}", style="bold", no_wrap=True, overflow="ellipsis")
+        table = _status_table()
+        styles = {"running": "cyan", "done": "green", "incomplete": "yellow", "failed": "red", "waiting": "dim"}
+        for state, label, began, ended in slots:
+            elapsed = _elapsed((ended if ended is not None else time.monotonic()) - began) if began is not None else "—"
+            table.add_row(Text(state, style=styles[state]), Text(elapsed, style="dim"), Text(label))
+        return Group(heading, table)
 
     def report(item: Item, note: str | None, error: str | CleanupDeferred | None) -> None:
-        label = f"{escape(tilde(item.project))} [dim]{escape(item.label)}[/]" if item.is_project else \
-            f"{escape(item.label)}" + (f" [dim]{escape(tilde(item.path))}[/]" if item.path else "")
+        outcomes[id(item)] = (item, note, error)
         if error is None:
             result.cleaned += 1
-            console.print(f"  [green]✓[/] {label}" + (f"  [dim]{escape(note)}[/]" if note else ""))
         elif isinstance(error, CleanupDeferred):
             result.deferred += 1
-            console.print(f"  [yellow]![/] {label} [dim]— {escape(str(error))}[/]")
         else:
             result.failed += 1
-            console.print(f"  [red]✗[/] {label} [dim]— {escape(error)}[/]")
 
     # A group with tool actions is one serial lane: Docker prunes must not compete
     # with each other, nor should a tool race filesystem deletes of its own caches.
@@ -2240,42 +2287,55 @@ def clean_all(items: list[Item], workers: int, roots: list[Path]) -> CleanupRepo
         lanes.append([i for i in group_items if i.mode != "action"] +
                      [i for i in group_items if i.mode == "action"])
 
-    with progress:
-        overall = progress.add_task("", total=len(items), detail="total")
+    with Live(get_renderable=render, console=console, transient=True,
+              auto_refresh=console.is_terminal, refresh_per_second=4, vertical_overflow="crop"):
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
             waiting = iter(lanes)
             pending = {}
 
-            def submit(lane: list[Item]) -> None:
+            def submit(lane: list[Item], slot: int) -> None:
                 item = lane[0]
-                task = progress.add_task("", total=1, detail=item.label)
-                pending[pool.submit(_delete, item, roots, cancelled)] = (lane, task)
+                slots[slot] = ("running", item.label, time.monotonic(), None)
+                pending[pool.submit(_delete, item, roots, cancelled)] = (lane, slot)
 
             try:
-                for _ in range(min(max(1, workers), len(lanes))):
-                    submit(next(waiting))
+                for slot in range(min(slot_count, len(lanes))):
+                    submit(next(waiting), slot)
                 while pending:
                     done, _ = wait(pending, return_when=FIRST_COMPLETED)
                     for future in done:
-                        lane, task = pending.pop(future)
+                        lane, slot = pending.pop(future)
                         item, note, error = future.result()
                         report(item, note, error)
-                        progress.advance(overall)
-                        progress.remove_task(task)
+                        state = "done" if error is None else "incomplete" if isinstance(error, CleanupDeferred) else "failed"
+                        slots[slot] = (state, item.label, slots[slot][2], time.monotonic())
                         remaining = lane[1:]
                         if isinstance(error, CleanupDeferred):
                             for skipped in remaining:
                                 report(skipped, None, CleanupDeferred("skipped after an incomplete cleanup in this group"))
-                                progress.advance(overall)
                             remaining = []
                         if remaining:
-                            submit(remaining)
+                            submit(remaining, slot)
                         else:
                             following = next(waiting, None)
                             if following is not None:
-                                submit(following)
+                                submit(following, slot)
             finally:
                 cancelled.set()
+    # Print once, in selection order. Never append logs above a moving live panel.
+    for item in items:
+        if id(item) not in outcomes:
+            continue
+        _, note, error = outcomes[id(item)]
+        label = Text("  ✓ " if error is None else "  ! " if isinstance(error, CleanupDeferred) else "  ✗ ",
+                     style="green" if error is None else "yellow" if isinstance(error, CleanupDeferred) else "red")
+        label.append(tilde(item.project) + "  " + item.label if item.is_project else item.label)
+        if item.path is not None and not item.is_project:
+            label.append("  " + tilde(item.path), style="dim")
+        detail = str(error) if error is not None else note
+        if detail:
+            label.append(" — " + detail, style="dim")
+        console.print(label)
     return result
 
 
@@ -2425,6 +2485,7 @@ def main() -> int:
     p.add_argument("--mem-watch", type=float, metavar="SECONDS", help="Refresh memory and show growth (requires --mem)")
     p.add_argument("--list", action="store_true", help="List cleaner groups and exit")
     p.add_argument("--size-jobs", type=int, default=None, help="Parallel sizing workers")
+    p.add_argument("--sizes", action="store_true", help="Measure directory and Docker cache sizes (slower; skipped by default)")
     p.add_argument("--clean-jobs", type=int, default=None, help="Parallel cleanup workers")
     p.add_argument("--command-timeout", type=float, metavar="SECONDS",
                    help="Time limit per cleanup command (default 60); incomplete commands are not retried")
@@ -2543,6 +2604,7 @@ def main() -> int:
         docker_volumes=docker_volumes, size_jobs=size_jobs, sweeps=sweeps, orphan_dirs=orphan_dirs,
         measure_active=args.audit,
         command_timeout=command_timeout,
+        measure_sizes=args.sizes or args.audit,
     )
     if args.mem:
         ok = run_mem(ctx, top=args.mem_top or 10, pattern=args.mem_filter or "", by_tree=args.mem_tree,
@@ -2570,6 +2632,8 @@ def main() -> int:
 
     console.print()
     console.print(render_table(to_clean, threshold, aggressive))
+    if not ctx.measure_sizes:
+        console.print("[dim]Sizes not measured — add --sizes for byte counts. Actual freed disk is reported after cleanup.[/]")
     for n in notes:
         console.print(n)
 
@@ -2588,10 +2652,11 @@ def main() -> int:
     freed = max(0, free_after - free_before)
 
     est = sum(i.size or 0 for i in to_clean if not i.ram)
+    estimate = f" [dim](estimated {human_size(est)})[/]" if ctx.measure_sizes else ""
     body = (f"[bold green]✓ cleaned {result.cleaned}[/]/[bold]{len(to_clean)}[/] item(s)"
             + (f"  ([yellow]{result.deferred} incomplete/skipped[/])" if result.deferred else "")
             + (f"  ([red]{result.failed} failed[/])" if result.failed else "")
-            + f"  •  freed [bold green]{human_size(freed)}[/] [dim](estimated {human_size(est)})[/]")
+            + f"  •  freed [bold green]{human_size(freed)}[/]" + estimate)
     console.print(Panel(Group(Text.from_markup(body), disk_line()),
                         border_style="yellow" if result.failed or result.deferred else "green", box=ROUNDED))
     return 1 if result.failed or result.deferred else 0

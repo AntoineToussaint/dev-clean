@@ -5,7 +5,7 @@
 A single-file Python script with a friendly TUI. Useful when your laptop has 9 GB free and `go build` starts failing with *no space left on device*.
 
 ```
-$ dev-cleaner --dry-run
+$ dev-cleaner --dry-run --sizes
 
 ╭──────────────────────────────────────────────────────────────────────────────╮
 │  🧹  dev-cleaner                                                             │
@@ -82,6 +82,7 @@ The installer:
 
 ```bash
 dev-cleaner --dry-run          # show what would be cleaned (no changes)
+dev-cleaner --dry-run --sizes  # also measure byte counts (slower)
 dev-cleaner                    # scan, list, prompt, clean
 dev-cleaner --yes              # skip the confirmation prompt
 dev-cleaner --aggressive       # also wipe dependency download caches + all unused docker images
@@ -135,7 +136,9 @@ The audit changes nothing. Cache pruning means later rebuilds; removing a builde
 
 Use `dev-cleaner --mem` for memory diagnostics: it does not discover projects or size build directories. Plain `dev-cleaner` performs a disk-cleanup scan. Its default root is `~`, so it discovers projects across every checkout and worktree under directories such as `~/.lazybox`; a large worktree forest can take minutes. For a focused disk scan, pass `--root ~/development` or set narrower `roots` in the config.
 
-Global cleaner checks run up to four at a time while project discovery runs. Docker audits read daemon disk usage, container memory and builder inventories concurrently, and measure up to four builder caches at once. The normal Docker scan also measures builder caches concurrently. Results retain their usual order and one failed probe does not hide other groups. Directory sizing still uses `--size-jobs` (default 16).
+Normal cleanup skips recursive directory sizing and Docker disk/cache size queries. It shows targets with unmeasured sizes and reports actual freed disk after cleanup. Add `--sizes` for directory byte counts and Docker cache estimates; `--audit` also enables measurements. This avoids walking millions of cache files merely to print a number before deleting them.
+
+Global cleaner checks run up to four at a time while project discovery runs. Docker audits read daemon disk usage, container memory and builder inventories concurrently, and measure up to four builder caches at once. With `--sizes`, the normal Docker scan also measures builder caches concurrently. Results retain their usual order and one failed probe does not hide other groups. Opt-in directory sizing uses `--size-jobs` (default 16); each directory/batch size read has a 30-second limit and unavailable sizes stay unknown. A timed-out `du` is never restarted as a Python walk.
 
 Project discovery shows a directory count and current path throughout the walk, even where no build directories are found. Activity checks stop as soon as a recent source establishes that a project must be kept. Normal cleanup skips sizing active projects' build directories; `--audit` measures them when you want the full disk breakdown. Stale projects still receive the full activity check before qualifying for cleanup.
 
@@ -144,6 +147,8 @@ This overlaps waits for independent tools without adding setup or flags. A singl
 ### Cleanup that keeps moving
 
 Cleanup runs independent groups concurrently, limited by `--clean-jobs` (default 4). Actions within one tool group remain serial, including Docker prunes and any filesystem cleanup of that tool's caches. Each running action has its own elapsed timer.
+
+The scan display reserves three fixed rows for projects, tools and sizes. Cleanup reserves fixed worker rows; completed jobs do not remove rows or shift the others. Long paths are clipped to one line in the live display. Completion details print once in selection order after cleanup, rather than scrolling above the running jobs.
 
 External cleanup commands have a 60-second limit. On timeout, dev-cleaner stops the client and its plugins, marks cleanup incomplete, and skips later actions in that group. Other groups continue. A Docker daemon may keep working after its client stops; timeout does not prove that pruning was cancelled or finished. Ctrl-C cancels running command clients too; filesystem deletions already in progress finish before exit.
 
@@ -295,6 +300,7 @@ dev-cleaner --completion fish > ~/.config/fish/completions/dev-cleaner.fish
 | `--mem-watch SECONDS` | | Refresh memory, showing deltas since the previous snapshot; requires `--mem`. Ctrl-C stops. |
 | `--list` | | Show the groups table and exit. |
 | `--size-jobs N` | `16` | Parallel sizing workers (`du -sk`). |
+| `--sizes` | off | Measure directory sizes and Docker disk/cache estimates; slower. Implied by `--audit`. |
 | `--clean-jobs N` | `4` | Parallel cleanup workers. |
 | `--command-timeout SECONDS` | `60` | Time limit per external cleanup command; incomplete groups are not retried. |
 | `--config PATH` | `~/.config/dev-cleaner/config.toml` | Alternate config file. |
@@ -308,7 +314,7 @@ dev-cleaner --completion fish > ~/.config/fish/completions/dev-cleaner.fish
 2. For every dir holding a project marker (`Cargo.toml`, `package.json`, `go.mod`, `*.csproj`, …) records its sibling build dirs per the rules table.
 3. Measures each top-level project's last source edit in parallel; nested projects inherit it.
 4. Probes the global caches: asks `go env`, `docker system df`, `docker buildx ls`/`du`, `brew cleanup -n`, `uv cache dir`, `pnpm store path`, checks a list of known cache paths, and lists idle entries in the temp dirs and `[[extra]]` dirs.
-5. Sizes everything with `du -sk` in parallel, dedupes, and shows the grouped table plus a note about what `--aggressive` would add and which active projects were skipped.
+5. Dedupes and shows the grouped table plus notes about `--aggressive` and active projects. Directory sizes are measured with parallel `du -sk` only when `--sizes` or `--audit` is requested; normal cleanup does not wait for size walks.
 6. On confirm: independent cleanup groups and filesystem deletes run concurrently; actions sharing a tool group stay serial. External commands have a configurable 60-second time limit. Busy caches and timed-out commands are reported as incomplete, and later actions in that group are skipped. The summary reports actual freed disk and counts successful, incomplete/skipped, and failed items separately.
 
 One broken tool never sinks the run: a hung Docker daemon or a failing `brew` just produces a warning line.

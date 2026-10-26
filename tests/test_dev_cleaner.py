@@ -277,7 +277,7 @@ def test_scan_sweeps_removes_only_idle(tmp_path: Path):
     ctx = dc.Context(roots=[], cutoff=time.time() - 86400, extra_skip=set(), groups=set(dc.ALL_GROUPS),
                      aggressive=False, docker_volumes=False, size_jobs=2)
     [item] = dc.scan_sweeps([dc.Sweep("extra", "idle entries", tmp_path, (tmp_path,))], ctx)
-    assert "1 entries" in item.note and item.size > 0
+    assert "1 entries" in item.note and item.size is None
     assert item.action() == "removed 1"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["com.apple.thing", "new"]
 
@@ -351,7 +351,7 @@ BUILDX = "\n".join(json.dumps(d) for d in [
 
 def _docker_ctx(volumes=False):
     return dc.Context(roots=[], cutoff=0, extra_skip=set(), groups=set(dc.ALL_GROUPS),
-                      aggressive=False, docker_volumes=volumes, size_jobs=2)
+                      aggressive=False, docker_volumes=volumes, size_jobs=2, measure_sizes=True)
 
 
 def _docker(monkeypatch, outputs, fail=frozenset()):
@@ -1036,3 +1036,115 @@ def test_docker_cleanup_actions_use_configured_timeout(monkeypatch):
     ctx.command_timeout = 17
     assert dc.scan_docker(ctx)
     assert timeouts and set(timeouts) == {17}
+
+
+# --- fast inventory and stable terminal layout -------------------------------
+
+def test_normal_scan_never_sizes_directories(monkeypatch):
+    ctx = _docker_ctx()
+    ctx.groups = {"go"}
+    ctx.measure_sizes = False
+    monkeypatch.setattr(dc, "GLOBAL_SCANNERS", {"go": lambda c: [dc.Item("go", "cache", Path("/cache"))]})
+    monkeypatch.setattr(dc, "scan_known_caches", lambda c: [])
+    monkeypatch.setattr(dc, "size_items", lambda *a, **kw: pytest.fail("normal cleanup must not recursively size caches"))
+    [item] = dc.scan_all(ctx)
+    assert item.size is None
+
+
+def test_fast_docker_inventory_never_queries_disk_usage(monkeypatch):
+    _docker(monkeypatch, {("buildx", "ls", "--format", "{{json .}}"): BUILDX})
+    fake = dc.run
+    def run(cmd, **kw):
+        assert tuple(cmd[1:3]) not in {("system", "df"), ("buildx", "du")}
+        return fake(cmd, **kw)
+    monkeypatch.setattr(dc, "run", run)
+    ctx = _docker_ctx()
+    ctx.measure_sizes = False
+    items = dc.scan_docker(ctx)
+    assert any(item.label == "docker buildx prune (lane)" for item in items)
+    assert all(item.size is None for item in items)
+    assert not any("failed" in warning for warning in ctx.warnings)
+
+
+def test_fast_temp_sweep_never_sizes_entries(tmp_path, monkeypatch):
+    mk(tmp_path, "old", files={"data": "x"})
+    _age(tmp_path / "old", 5)
+    ctx = _docker_ctx()
+    ctx.cutoff = time.time() - 86400
+    ctx.measure_sizes = False
+    monkeypatch.setattr(dc, "paths_size", lambda *a: pytest.fail("sweeps must not start hidden size walks"))
+    [item] = dc.scan_sweeps([dc.Sweep("extra", "cache", tmp_path, (tmp_path,))], ctx)
+    assert item.size is None and "1 entries" in item.note
+
+
+def test_timed_out_sizing_does_not_restart_in_python(monkeypatch):
+    monkeypatch.setattr(dc.shutil, "which", lambda name: "/usr/bin/du")
+    monkeypatch.setattr(dc, "run", lambda *a, **kw: None)
+    monkeypatch.setattr(dc.os, "walk", lambda *a, **kw: pytest.fail("do not repeat a timed-out size walk"))
+    assert dc.dir_size(Path("/huge-cache")) is None
+
+
+def test_scan_progress_rows_do_not_move_or_wrap():
+    from io import StringIO
+    from rich.console import Console
+    c = Console(file=StringIO(), width=60)
+    progress = dc.ScanProgress(console=c, auto_refresh=False)
+    def snapshot():
+        output = StringIO()
+        Console(file=output, width=60).print(progress.get_renderable())
+        return output.getvalue().splitlines()
+    def check():
+        lines = snapshot()
+        assert len(lines) == 3
+        assert lines[0].startswith("Projects")
+        assert lines[1].startswith("Tools")
+        assert lines[2].startswith("Sizes")
+        assert all(len(line) <= 60 for line in lines)
+    check()
+    a = progress.add_task("checking docker", detail="x" * 500)
+    b = progress.add_task("scanning ~ (100,000 dirs)", detail="/very/long/path/" * 100)
+    check()
+    progress.remove_task(a)
+    check()
+    progress.remove_task(b)
+    progress.add_task("sizing 100 dir(s)", total=100, detail="/very/long/path/" * 100)
+    check()
+
+
+def test_cleanup_live_rows_are_fixed_and_results_print_afterwards(monkeypatch):
+    from io import StringIO
+    from rich.console import Console
+    output = StringIO()
+    monkeypatch.setattr(dc, "console", Console(file=output, width=60))
+    frames = []
+    render = None
+    class CaptureLive:
+        def __init__(self, *, get_renderable, **kwargs):
+            nonlocal render
+            render = get_renderable
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+    def capture():
+        frame = StringIO()
+        Console(file=frame, width=60).print(render())
+        frames.append(frame.getvalue().splitlines())
+        assert output.getvalue() == "", "completion logs must wait until the live display closes"
+        return "done"
+    monkeypatch.setattr(dc, "Live", CaptureLive)
+    items = [dc.Item("go", "first " + "x" * 500, mode="action", action=capture),
+             dc.Item("go", "second", mode="action", action=capture)]
+    assert dc.clean_all(items, 2, []) == dc.CleanupReport(cleaned=2)
+    assert frames and {len(frame) for frame in frames} == {3}  # heading plus two reserved slots
+    assert all(len(line) <= 60 for frame in frames for line in frame)
+    assert output.getvalue().index("first") < output.getvalue().index("second")
+
+
+def test_unmeasured_total_is_not_presented_as_zero_bytes():
+    from io import StringIO
+    from rich.console import Console
+    output = StringIO()
+    Console(file=output, width=120).print(dc.render_table([dc.Item("go", "cache", Path("/cache"))], "1d", False))
+    assert "not measured" in output.getvalue()
+    assert "0.0 B" not in output.getvalue()
