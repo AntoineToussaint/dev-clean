@@ -219,7 +219,7 @@ def test_render_config_roundtrip(tmp_path: Path):
     cfg = tomllib.loads(text)
     assert cfg == {
         "roots": ["~/dev"], "ignore": ["archive"], "days": 3.0, "aggressive": True,
-        "skip": ["docker"], "size_jobs": 16, "clean_jobs": 4, "docker": {"volumes": True},
+        "skip": ["docker"], "size_jobs": 16, "clean_jobs": 4, "command_timeout": 60, "docker": {"volumes": True},
         "procs": {"orphan_dirs": []},
     }
 
@@ -878,3 +878,161 @@ def test_discovery_reports_progress_without_waiting_for_project_matches(tmp_path
     visited = []
     assert list(dc.find_projects(tmp_path, visit=visited.append)) == []
     assert set(visited) == {tmp_path, tmp_path / "empty", tmp_path / "empty/nested"}
+
+
+# --- bounded, concurrent cleanup ---------------------------------------------
+
+def test_cleanup_command_timeout_stops_client_and_plugin(tmp_path):
+    import subprocess
+    child_pid = tmp_path / "child.pid"
+    script = ("import subprocess,sys,time; from pathlib import Path; "
+              "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
+              f"Path({str(child_pid)!r}).write_text(str(child.pid)); time.sleep(30)")
+    start = time.monotonic()
+    with pytest.raises(dc.CleanupDeferred, match="timed out after 1s; client stopped"):
+        dc._cmd_action([sys.executable, "-c", script], timeout=1)()
+    assert time.monotonic() - start < 5
+    assert child_pid.exists(), "test must start a child to verify plugin cancellation"
+    pid = int(child_pid.read_text())
+    try:
+        # An orphan may briefly be a zombie waiting for init to reap it.
+        state = subprocess.run(["ps", "-p", str(pid), "-o", "stat="], capture_output=True, text=True).stdout.strip()
+        assert not state or state.startswith("Z"), f"plugin survived timeout: {state}"
+    finally:
+        try:
+            os.kill(pid, dc.signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def test_cleanup_command_success_and_busy_cache_error():
+    action = dc._cmd_action([sys.executable, "-c", "print('Total reclaimed: 100MB')"],
+                            summary=lambda out: out.split(": ")[1])
+    assert action() == "100MB"
+    action = dc._cmd_action([sys.executable, "-c",
+                            "import sys; sys.stderr.write('go: unlinkat cache: directory not empty'); sys.exit(1)"])
+    with pytest.raises(dc.CleanupDeferred, match="cache changed during cleanup"):
+        action()
+
+
+def test_clear_dir_keeps_busy_entries_and_cleans_the_rest(tmp_path, monkeypatch):
+    import errno
+    busy = mk(tmp_path, "busy", files={"still-active": "data"})
+    mk(tmp_path, "idle", files={"cached": "data"})
+    (tmp_path / "loose").write_text("data")
+    real = dc.force_rmtree
+    def remove(path):
+        if path == busy:
+            raise OSError(errno.ENOTEMPTY, "Directory not empty", str(path))
+        real(path)
+    monkeypatch.setattr(dc, "force_rmtree", remove)
+    with pytest.raises(dc.CleanupDeferred, match="1 busy cache entries left in place"):
+        dc.clear_dir(tmp_path)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["busy"]
+    assert (busy / "still-active").read_text() == "data"
+
+
+def test_cleanup_groups_overlap_but_same_backend_is_serial(monkeypatch):
+    import threading
+    from io import StringIO
+    from rich.console import Console
+    monkeypatch.setattr(dc, "console", Console(file=StringIO(), width=120))
+    barrier = threading.Barrier(2, timeout=5)
+    first_done = threading.Event()
+    def first():
+        barrier.wait()
+        first_done.set()
+        return "done"
+    def independent():
+        barrier.wait()
+        return "done"
+    def second():
+        assert first_done.is_set(), "same-backend operations must stay serial"
+        return "done"
+    items = [dc.Item("docker", "first", mode="action", action=first),
+             dc.Item("docker", "second", mode="action", action=second),
+             dc.Item("brew", "independent", mode="action", action=independent)]
+    assert dc.clean_all(items, 2, []) == dc.CleanupReport(cleaned=3)
+
+
+def test_incomplete_backend_is_skipped_without_blocking_other_groups(monkeypatch):
+    from io import StringIO
+    from rich.console import Console
+    monkeypatch.setattr(dc, "console", Console(file=StringIO(), width=120))
+    def timeout():
+        raise dc.CleanupDeferred("timed out")
+    items = [dc.Item("docker", "slow", mode="action", action=timeout),
+             dc.Item("docker", "later", mode="action", action=lambda: pytest.fail("no overlapping daemon prune")),
+             dc.Item("go", "healthy", mode="action", action=lambda: "done")]
+    assert dc.clean_all(items, 2, []) == dc.CleanupReport(cleaned=1, deferred=2)
+    assert "skipped after an incomplete cleanup" in dc.console.file.getvalue()
+
+
+def test_cleanup_cancellation_does_not_wait_for_command_deadline():
+    import threading
+    cancelled = threading.Event()
+    item = dc.Item("docker", "slow", mode="action", action=dc._cmd_action(
+        [sys.executable, "-c", "import time; time.sleep(30)"], timeout=60))
+    timer = threading.Timer(0.2, cancelled.set)
+    start = time.monotonic()
+    timer.start()
+    try:
+        _, _, error = dc._delete(item, [], cancelled)
+        assert isinstance(error, dc.CleanupDeferred) and "cancelled" in str(error)
+        assert time.monotonic() - start < 3
+    finally:
+        timer.cancel()
+        dc._cleanup_thread.cancelled = None
+
+
+def test_cleanup_failure_is_counted_separately_from_deferred(monkeypatch):
+    from io import StringIO
+    from rich.console import Console
+    monkeypatch.setattr(dc, "console", Console(file=StringIO(), width=120))
+    def broken():
+        raise RuntimeError("permission denied")
+    result = dc.clean_all([dc.Item("go", "broken", mode="action", action=broken)], 1, [])
+    assert result == dc.CleanupReport(failed=1)
+    assert dc.clean_all([], 1, []) == dc.CleanupReport()
+
+
+@pytest.mark.parametrize("seconds", ["0", "-1", "nan", "inf"])
+def test_command_timeout_validation(monkeypatch, tmp_path, seconds):
+    monkeypatch.setattr(sys, "argv", ["dev-cleaner", "--command-timeout", seconds,
+                                     "--config", str(tmp_path / "none.toml")])
+    with pytest.raises(SystemExit) as error:
+        dc.main()
+    assert error.value.code == 2
+
+
+def test_ctrl_c_cancels_concurrent_cleanup_clients(monkeypatch):
+    import threading
+    from io import StringIO
+    from rich.console import Console
+    monkeypatch.setattr(dc, "console", Console(file=StringIO(), width=120))
+    started = threading.Event()
+    command = dc._cmd_action([sys.executable, "-c", "import time; time.sleep(30)"], timeout=60)
+    def action():
+        started.set()
+        return command()
+    def interrupt(*args, **kwargs):
+        assert started.wait(2)
+        raise KeyboardInterrupt
+    monkeypatch.setattr(dc, "wait", interrupt)
+    start = time.monotonic()
+    with pytest.raises(KeyboardInterrupt):
+        dc.clean_all([dc.Item("docker", "slow", mode="action", action=action)], 2, [])
+    assert time.monotonic() - start < 3
+
+
+def test_docker_cleanup_actions_use_configured_timeout(monkeypatch):
+    _docker(monkeypatch, {("system", "df", "--format", "{{json .}}"): DF})
+    timeouts = []
+    def command(cmd, timeout=60, **kwargs):
+        timeouts.append(timeout)
+        return lambda: None
+    monkeypatch.setattr(dc, "_cmd_action", command)
+    ctx = _docker_ctx()
+    ctx.command_timeout = 17
+    assert dc.scan_docker(ctx)
+    assert timeouts and set(timeouts) == {17}

@@ -141,6 +141,16 @@ Project discovery shows a directory count and current path throughout the walk, 
 
 This overlaps waits for independent tools without adding setup or flags. A single slow daemon request can still take its timeout. In a controlled benchmark of six simulated 100 ms builder reads, the parallel version took 0.21 seconds versus 0.62 seconds sequentially; actual speedups depend on the tools and workload.
 
+### Cleanup that keeps moving
+
+Cleanup runs independent groups concurrently, limited by `--clean-jobs` (default 4). Actions within one tool group remain serial, including Docker prunes and any filesystem cleanup of that tool's caches. Each running action has its own elapsed timer.
+
+External cleanup commands have a 60-second limit. On timeout, dev-cleaner stops the client and its plugins, marks cleanup incomplete, and skips later actions in that group. Other groups continue. A Docker daemon may keep working after its client stops; timeout does not prove that pruning was cancelled or finished. Ctrl-C cancels running command clients too; filesystem deletions already in progress finish before exit.
+
+Use `--command-timeout 300` (or `command_timeout = 300` in config) when you deliberately want to wait longer. This limits external cleanup commands, not scanning or filesystem deletion. To leave Docker alone for a run, use `--skip docker`.
+
+Caches written by active builds can report “directory not empty.” Cleanup leaves busy entries in place, continues through other entries in that cache, and reports partial cleanup instead of retrying against active writers. Later cleanup in the same group is skipped; finish active builds before trying again. Incomplete/skipped items are counted separately from successful cleanup, and the command exits nonzero when anything is incomplete or failed.
+
 ## What gets cleaned
 
 Two tiers. **Default** removes things that are pure derived output: rebuilding them costs CPU, not network. **`--aggressive`** adds dependency *download* caches (re-fetched on the next build) and every Docker image not used by a container. The default run always tells you how much more `--aggressive` would free, so nothing is hidden.
@@ -217,7 +227,8 @@ aggressive = false
 skip = ["brew"]
 
 size_jobs = 16   # parallel sizing workers
-clean_jobs = 4   # parallel delete workers (disk bound; keep modest)
+clean_jobs = 4   # parallel cleanup workers (keep modest)
+command_timeout = 60  # seconds per external cleanup command
 
 [docker]
 # Prune unused volumes too. Off by default: volumes hold data.
@@ -284,7 +295,8 @@ dev-cleaner --completion fish > ~/.config/fish/completions/dev-cleaner.fish
 | `--mem-watch SECONDS` | | Refresh memory, showing deltas since the previous snapshot; requires `--mem`. Ctrl-C stops. |
 | `--list` | | Show the groups table and exit. |
 | `--size-jobs N` | `16` | Parallel sizing workers (`du -sk`). |
-| `--clean-jobs N` | `4` | Parallel delete workers. |
+| `--clean-jobs N` | `4` | Parallel cleanup workers. |
+| `--command-timeout SECONDS` | `60` | Time limit per external cleanup command; incomplete groups are not retried. |
 | `--config PATH` | `~/.config/dev-cleaner/config.toml` | Alternate config file. |
 | `--init` | | Interactive wizard (or `--init --yes` for static defaults). |
 | `--show-config` | | Print resolved config and exit. |
@@ -297,7 +309,7 @@ dev-cleaner --completion fish > ~/.config/fish/completions/dev-cleaner.fish
 3. Measures each top-level project's last source edit in parallel; nested projects inherit it.
 4. Probes the global caches: asks `go env`, `docker system df`, `docker buildx ls`/`du`, `brew cleanup -n`, `uv cache dir`, `pnpm store path`, checks a list of known cache paths, and lists idle entries in the temp dirs and `[[extra]]` dirs.
 5. Sizes everything with `du -sk` in parallel, dedupes, and shows the grouped table plus a note about what `--aggressive` would add and which active projects were skipped.
-6. On confirm: filesystem deletes run in parallel (read-only trees like Go's modcache are force-chmodded first); external commands (`docker system prune`, `brew cleanup`, `go clean -cache`) run one at a time. The summary reports actual freed disk, not just the estimate.
+6. On confirm: independent cleanup groups and filesystem deletes run concurrently; actions sharing a tool group stay serial. External commands have a configurable 60-second time limit. Busy caches and timed-out commands are reported as incomplete, and later actions in that group are skipped. The summary reports actual freed disk and counts successful, incomplete/skipped, and failed items separately.
 
 One broken tool never sinks the run: a hung Docker daemon or a failing `brew` just produces a warning line.
 
