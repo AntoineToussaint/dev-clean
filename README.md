@@ -5,7 +5,7 @@
 A single-file Python script with a friendly TUI. Useful when your laptop has 9 GB free and `go build` starts failing with *no space left on device*.
 
 ```
-$ dev-cleaner --dry-run
+$ dev-cleaner --dry-run --sizes
 
 ╭──────────────────────────────────────────────────────────────────────────────╮
 │  🧹  dev-cleaner                                                             │
@@ -82,6 +82,7 @@ The installer:
 
 ```bash
 dev-cleaner --dry-run          # show what would be cleaned (no changes)
+dev-cleaner --dry-run --sizes  # also measure byte counts (slower)
 dev-cleaner                    # scan, list, prompt, clean
 dev-cleaner --yes              # skip the confirmation prompt
 dev-cleaner --aggressive       # also wipe dependency download caches + all unused docker images
@@ -92,12 +93,68 @@ dev-cleaner --hours 2          # anything not touched in the last 2 hours
 dev-cleaner --root ~/code      # scan a specific directory for projects
 dev-cleaner --list             # what each group cleans
 dev-cleaner --audit            # biggest dirs on disk, and how much of each would be freed
-dev-cleaner --mem              # which programs hold the memory, and how many are orphaned
+dev-cleaner --mem              # memory hogs by program, plus PIDs, parents and commands
+dev-cleaner --mem --mem-tree   # combine an app/agent with its child processes
+dev-cleaner --mem --mem-watch 5 --mem-sort growth # watch which processes keep growing
+dev-cleaner --docker-audit     # Docker disk, container memory and individual buildx caches
 ```
 
 ### Where did my disk go?
 
 `--audit` measures your home dir (and the temp dirs) with `du`, shows every dir over 1 GB down to where the bulk sits, and puts next to each one what a default run and an `--aggressive` run would free there. Anything marked **not covered** is space dev-cleaner can't see: either a project tree outside your `roots`, or a disposable dir of some tool you can declare under `[[extra]]`. It changes nothing, and on a full disk it takes minutes.
+
+### Which processes hold my RAM?
+
+`--mem` shows host RAM, compression on macOS, available memory on Linux, swap use, programs ranked by memory, and individual processes with PID, parent PID, CPU, age and command. Programs are grouped by the reported executable, using its full path when available so different installations stay separate. Some processes report only a name; use the command and PID details to distinguish those. Small processes remain visible; there is no 256 MB cutoff.
+
+```bash
+dev-cleaner --mem --mem-top 20                         # more rows in each table
+dev-cleaner --mem --mem-filter claude                  # match PID, executable or command
+dev-cleaner --mem --mem-filter codefly --mem-tree      # matching families, including their descendants
+dev-cleaner --mem --mem-filter postgres --mem-full     # full executable paths and command arguments
+dev-cleaner --mem --mem-sort cpu                       # find CPU-heavy processes
+dev-cleaner --mem --mem-watch 5 --mem-sort growth       # memory changes between snapshots; Ctrl-C to stop
+```
+
+Process families follow same-owner parent links, stopping at init, service managers or a missing parent. With `--mem-tree`, a filter selects whole matching families so a small agent's large database child is included. The largest individual processes still appear in a second table. Commands are shortened to fit the terminal unless you pass `--mem-full`.
+
+Watch mode compares surviving processes with the same PID, start time, executable, owner and memory metric. New processes are marked `new`; exited processes are excluded from growth. Growth sorting becomes useful after the second snapshot. The refresh interval is a delay between scans; the report shows the actual elapsed time. macOS uses `top`'s physical footprint where available and labels RSS fallbacks; Linux uses RSS, which excludes swapped-out pages. Shared pages can appear in multiple processes, so summed memory is an estimate, not the amount stopping them will release.
+
+CPU is the average reported by `ps`. “Old / low CPU” counts processes older than `--days` / `--hours` with CPU at most 1%; it does not prove they have been idle for that duration. Swap use alone also does not establish current memory pressure. Orphan candidates are reported across the full snapshot, along with memory held by their same-owner descendants, and a command to preview cleanup.
+
+### What is Docker holding?
+
+`--docker-audit` reads the local daemon's image/container/volume/build-cache totals, running containers' memory and CPU, and allocated host VM disk size. It also lists each buildx builder once, with driver, node status, last activity when reported, and reclaimable cache for running local container builders. Stopped builders stay stopped; remote or unverified endpoints are skipped. A named Docker context is resolved before deciding whether it is local. Docker cleanup uses the same local-endpoint checks.
+
+Container-builder caches can survive daemon-level cache pruning. Builder estimates are shown separately from daemon and VM disk totals because these views can overlap. Some cache queries can take a while; unavailable measurements display `?`.
+
+The RAM visible to the daemon is capacity, not the VM's host memory consumption. Compare container memory with OrbStack/Docker/Colima processes in `--mem`; the difference also includes guest caches, services and differences in accounting. A large difference alone does not explain slow container starts.
+
+The audit changes nothing. Cache pruning means later rebuilds; removing a builder also removes its configuration. Restarting the runtime interrupts its workloads, and deleting volumes can remove persistent data. Preview the existing cleanup actions with `dev-cleaner --only docker --dry-run`. Space freed inside a VM may take time to return to the host filesystem.
+
+### Faster scans, same commands
+
+Use `dev-cleaner --mem` for memory diagnostics: it does not discover projects or size build directories. Plain `dev-cleaner` performs a disk-cleanup scan. Its default root is `~`, so it discovers projects across every checkout and worktree under directories such as `~/.lazybox`; a large worktree forest can take minutes. For a focused disk scan, pass `--root ~/development` or set narrower `roots` in the config.
+
+Normal cleanup skips recursive directory sizing and Docker disk/cache size queries. It shows targets with unmeasured sizes and reports actual freed disk after cleanup. Add `--sizes` for directory byte counts and Docker cache estimates; `--audit` also enables measurements. This avoids walking millions of cache files merely to print a number before deleting them.
+
+Global cleaner checks run up to four at a time while project discovery runs. Docker audits read daemon disk usage, container memory and builder inventories concurrently, and measure up to four builder caches at once. With `--sizes`, the normal Docker scan also measures builder caches concurrently. Results retain their usual order and one failed probe does not hide other groups. Opt-in directory sizing uses `--size-jobs` (default 16); each directory/batch size read has a 30-second limit and unavailable sizes stay unknown. A timed-out `du` is never restarted as a Python walk.
+
+Project discovery shows a directory count and current path throughout the walk, even where no build directories are found. Activity checks stop as soon as a recent source establishes that a project must be kept. Normal cleanup skips sizing active projects' build directories; `--audit` measures them when you want the full disk breakdown. Stale projects still receive the full activity check before qualifying for cleanup.
+
+This overlaps waits for independent tools without adding setup or flags. A single slow daemon request can still take its timeout. In a controlled benchmark of six simulated 100 ms builder reads, the parallel version took 0.21 seconds versus 0.62 seconds sequentially; actual speedups depend on the tools and workload.
+
+### Cleanup that keeps moving
+
+Cleanup runs independent groups concurrently, limited by `--clean-jobs` (default 4). Actions within one tool group remain serial, including Docker prunes and any filesystem cleanup of that tool's caches. Each running action has its own elapsed timer.
+
+The scan display reserves three fixed rows for projects, tools and sizes. Cleanup reserves fixed worker rows; completed jobs do not remove rows or shift the others. Long paths are clipped to one line in the live display. Completion details print once in selection order after cleanup, rather than scrolling above the running jobs.
+
+External cleanup commands have a 60-second limit. On timeout, dev-cleaner stops the client and its plugins, marks cleanup incomplete, and skips later actions in that group. Other groups continue. A Docker daemon may keep working after its client stops; timeout does not prove that pruning was cancelled or finished. Ctrl-C cancels running command clients too; filesystem deletions already in progress finish before exit.
+
+Use `--command-timeout 300` (or `command_timeout = 300` in config) when you deliberately want to wait longer. This limits external cleanup commands, not scanning or filesystem deletion. To leave Docker alone for a run, use `--skip docker`.
+
+Caches written by active builds can report “directory not empty.” Cleanup leaves busy entries in place, continues through other entries in that cache, and reports partial cleanup instead of retrying against active writers. Later cleanup in the same group is skipped; finish active builds before trying again. Incomplete/skipped items are counted separately from successful cleanup, and the command exits nonzero when anything is incomplete or failed.
 
 ## What gets cleaned
 
@@ -128,9 +185,7 @@ Two tiers. **Default** removes things that are pure derived output: rebuilding t
 | 📁 extra | idle children of the dirs you list under `[[extra]]` | |
 | 🧟 procs | stops idle orphaned processes (parent gone) that run from a temp dir or a `[procs] orphan_dirs` dir | |
 
-**Orphaned processes.** A full disk is often the visible half of the problem; the other half is RAM. Test binaries and tool plugins that outlive a killed parent sit at 0% CPU forever, and a few hundred of them push a machine into swap, where `kernel_task` then burns cores compressing memory. A process is stopped only when it is yours, has been re-parented to init, is older than the idle threshold, uses no CPU, and its executable lives in a temp dir (`go test` binaries, throwaway builds) or in a dir you listed under `[procs] orphan_dirs` (a tool's plugin dir). It gets SIGTERM first so it can tear down its own children, SIGKILL after 8 seconds. Its row shows RAM, which is never added to the disk total.
-
-`--mem` is the read-only view: swap in use, memory by program with how many copies have been idle for over a day, and the orphan count. Dozens of old idle copies of one program (agent sessions, language servers) are sessions nobody closed; dev-cleaner reports those and leaves them to you.
+**Orphaned processes.** Test binaries and tool plugins can outlive the run that started them and keep holding RAM. A process qualifies for cleanup only when it is yours, has parent PID 1, is older than the configured threshold, has `ps` CPU at most 1%, and its executable lives in a temp dir (`go test` binaries, throwaway builds) or a dir you listed under `[procs] orphan_dirs`. PID 1 alone does not prove a process is abandoned; only list plugin directories whose processes should end with their parent run. Cleanup rechecks the process's executable, owner and start time to avoid signalling a recycled PID. It sends SIGTERM first so a supervisor can tear down its children, then SIGKILL after 8 seconds if it remains. Children are not independently targeted. Its row shows RAM, which is never added to the disk total. Use `--mem` to investigate and `--only procs --dry-run` to preview candidates.
 
 **Temp dirs.** macOS only clears `/tmp` on reboot and `$TMPDIR` after 3 days, and build tools and agents can fill both with gigabytes of throwaway Go caches and checkouts in a day. An entry goes only when it belongs to you, nothing in its top two levels changed within the threshold, and it holds no sockets or pipes (a live program's IPC). `com.apple.*`, `tmux-*`, `ssh-*` and the like are always kept. Each entry is checked again right before it is removed, so one that came back into use since the scan is left alone.
 
@@ -177,7 +232,8 @@ aggressive = false
 skip = ["brew"]
 
 size_jobs = 16   # parallel sizing workers
-clean_jobs = 4   # parallel delete workers (disk bound; keep modest)
+clean_jobs = 4   # parallel cleanup workers (keep modest)
+command_timeout = 60  # seconds per external cleanup command
 
 [docker]
 # Prune unused volumes too. Off by default: volumes hold data.
@@ -234,10 +290,19 @@ dev-cleaner --completion fish > ~/.config/fish/completions/dev-cleaner.fish
 | `--only GROUPS` | all | Comma-separated groups to run. |
 | `--skip GROUPS` | | Comma-separated groups to skip (merged with config). |
 | `--audit` | | Show the biggest dirs and how much of each would be freed; change nothing. |
-| `--mem` | | Show memory by program and the orphaned processes; change nothing. |
+| `--docker-audit` | | Read-only Docker disk, container memory and per-builder cache inventory. |
+| `--mem` | | Read-only host memory, programs, individual PIDs and orphan candidates. |
+| `--mem-top N` | `10` | Rows per memory table; requires `--mem`. |
+| `--mem-filter TEXT` | | Case-insensitive match on PID, executable or command. With `--mem-tree`, selects whole matching families. |
+| `--mem-tree` | off | Group memory by process family; requires `--mem`. |
+| `--mem-full` | off | Wrap full paths and commands instead of shortening them; requires `--mem`. |
+| `--mem-sort {memory,cpu,growth}` | `memory` | Sort both memory tables. Growth requires `--mem-watch`. |
+| `--mem-watch SECONDS` | | Refresh memory, showing deltas since the previous snapshot; requires `--mem`. Ctrl-C stops. |
 | `--list` | | Show the groups table and exit. |
 | `--size-jobs N` | `16` | Parallel sizing workers (`du -sk`). |
-| `--clean-jobs N` | `4` | Parallel delete workers. |
+| `--sizes` | off | Measure directory sizes and Docker disk/cache estimates; slower. Implied by `--audit`. |
+| `--clean-jobs N` | `4` | Parallel cleanup workers. |
+| `--command-timeout SECONDS` | `60` | Time limit per external cleanup command; incomplete groups are not retried. |
 | `--config PATH` | `~/.config/dev-cleaner/config.toml` | Alternate config file. |
 | `--init` | | Interactive wizard (or `--init --yes` for static defaults). |
 | `--show-config` | | Print resolved config and exit. |
@@ -249,8 +314,8 @@ dev-cleaner --completion fish > ~/.config/fish/completions/dev-cleaner.fish
 2. For every dir holding a project marker (`Cargo.toml`, `package.json`, `go.mod`, `*.csproj`, …) records its sibling build dirs per the rules table.
 3. Measures each top-level project's last source edit in parallel; nested projects inherit it.
 4. Probes the global caches: asks `go env`, `docker system df`, `docker buildx ls`/`du`, `brew cleanup -n`, `uv cache dir`, `pnpm store path`, checks a list of known cache paths, and lists idle entries in the temp dirs and `[[extra]]` dirs.
-5. Sizes everything with `du -sk` in parallel, dedupes, and shows the grouped table plus a note about what `--aggressive` would add and which active projects were skipped.
-6. On confirm: filesystem deletes run in parallel (read-only trees like Go's modcache are force-chmodded first); external commands (`docker system prune`, `brew cleanup`, `go clean -cache`) run one at a time. The summary reports actual freed disk, not just the estimate.
+5. Dedupes and shows the grouped table plus notes about `--aggressive` and active projects. Directory sizes are measured with parallel `du -sk` only when `--sizes` or `--audit` is requested; normal cleanup does not wait for size walks.
+6. On confirm: independent cleanup groups and filesystem deletes run concurrently; actions sharing a tool group stay serial. External commands have a configurable 60-second time limit. Busy caches and timed-out commands are reported as incomplete, and later actions in that group are skipped. The summary reports actual freed disk and counts successful, incomplete/skipped, and failed items separately.
 
 One broken tool never sinks the run: a hung Docker daemon or a failing `brew` just produces a warning line.
 

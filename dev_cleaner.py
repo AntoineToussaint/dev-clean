@@ -13,7 +13,9 @@ Homebrew, Xcode DerivedData, cargo/npm/uv/pip/gradle caches, ...) and idle temp 
 from __future__ import annotations
 
 import argparse
+import errno
 import json
+import math
 import os
 import re
 import shutil
@@ -25,22 +27,21 @@ import tempfile
 import time
 import tomllib
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from threading import Event, local
 from typing import Callable
 
 from rich.box import ROUNDED
 from rich.console import Console, Group
+from rich.live import Live
 from rich.markup import escape
 from rich.panel import Panel
 from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
     Progress,
     SpinnerColumn,
     TextColumn,
-    TimeElapsedColumn,
 )
 from rich.prompt import Confirm, FloatPrompt, Prompt
 from rich.table import Table
@@ -55,6 +56,7 @@ MAC_CACHES = HOME / "Library" / "Caches"
 
 SAFE = "safe"
 AGGRESSIVE = "aggressive"
+PROBE_JOBS = 4                      # cap concurrent tool probes separately from disk sizing
 
 # ---------------------------------------------------------------------------
 # Scanning rules
@@ -234,6 +236,7 @@ DEFAULTS: dict = {
     "skip": [],
     "size_jobs": 16,
     "clean_jobs": 4,
+    "command_timeout": 60,
     "docker": {"volumes": False},
     "extra": [],
     "procs": {"orphan_dirs": []},
@@ -280,8 +283,11 @@ skip = {skip!r}
 # Parallel workers when sizing dirs (I/O bound).
 size_jobs = 16
 
-# Parallel delete workers (disk bound; keep modest).
+# Parallel cleanup workers (disk bound; keep modest).
 clean_jobs = 4
+
+# Maximum seconds per external cleanup command; slow commands are left incomplete.
+command_timeout = 60
 
 [docker]
 # Prune unused volumes too. Off by default: volumes hold data.
@@ -334,10 +340,11 @@ _dev_cleaner() {{
     COMPREPLY=()
     cur="${{COMP_WORDS[COMP_CWORD]}}"
     prev="${{COMP_WORDS[COMP_CWORD-1]}}"
-    opts="--root --days --hours --dry-run --yes --aggressive --only --skip --audit --mem --list --size-jobs --clean-jobs --config --init --show-config --completion -n -y -a -h --help"
+    opts="--root --days --hours --dry-run --yes --aggressive --only --skip --audit --docker-audit --mem --mem-top --mem-filter --mem-tree --mem-full --mem-sort --mem-watch --list --sizes --size-jobs --clean-jobs --command-timeout --config --init --show-config --completion -n -y -a -h --help"
     case "$prev" in
         --root|--config) COMPREPLY=( $(compgen -f -- "$cur") ); return ;;
         --completion) COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ); return ;;
+        --mem-sort) COMPREPLY=( $(compgen -W "memory cpu growth" -- "$cur") ); return ;;
         --only|--skip) COMPREPLY=( $(compgen -W "{_GROUPS_WS}" -- "$cur") ); return ;;
     esac
     if [[ "$cur" == -* ]]; then
@@ -360,10 +367,19 @@ _dev_cleaner() {{
         '--only[Only run these groups]:groups:_values -s , group {_GROUPS_WS}' \
         '--skip[Skip these groups]:groups:_values -s , group {_GROUPS_WS}' \
         '--audit[Show the biggest dirs and how much of each would be freed]' \
+        '--docker-audit[Read-only Docker disk, container memory and builder cache inventory]' \
         '--mem[Show which programs hold the memory and how many are orphaned]' \
+        '--mem-top[Rows per memory table]:N:' \
+        '--mem-filter[Match PID, executable or command]:text:' \
+        '--mem-tree[Group memory by process family]' \
+        '--mem-full[Show full paths and commands]' \
+        '--mem-sort[Sort memory tables]:sort:(memory cpu growth)' \
+        '--mem-watch[Refresh memory and show growth]:seconds:' \
         '--list[List cleaner groups and exit]' \
+        '--sizes[Measure directory and Docker cache sizes (slower)]' \
         '--size-jobs[Parallel sizing workers]:N:' \
-        '--clean-jobs[Parallel delete workers]:N:' \
+        '--clean-jobs[Parallel cleanup workers]:N:' \
+        '--command-timeout[Cleanup command time limit]:seconds:' \
         '--config[Config path]:file:_files' \
         '--init[Interactive setup / write a starter config]' \
         '--show-config[Print resolved config and exit]' \
@@ -383,10 +399,19 @@ complete -c dev-cleaner -s a -l aggressive -d "Also clean dependency caches / un
 complete -c dev-cleaner -l only -d "Only run these groups" -x -a "{_GROUPS_WS}"
 complete -c dev-cleaner -l skip -d "Skip these groups" -x -a "{_GROUPS_WS}"
 complete -c dev-cleaner -l audit -d "Show the biggest dirs and how much of each would be freed"
+complete -c dev-cleaner -l docker-audit -d "Read-only Docker disk, container memory and builder cache inventory"
 complete -c dev-cleaner -l mem -d "Show which programs hold the memory and how many are orphaned"
+complete -c dev-cleaner -l mem-top -d "Rows per memory table" -x
+complete -c dev-cleaner -l mem-filter -d "Match PID, executable or command" -x
+complete -c dev-cleaner -l mem-tree -d "Group memory by process family"
+complete -c dev-cleaner -l mem-full -d "Show full paths and commands"
+complete -c dev-cleaner -l mem-sort -d "Sort memory tables" -x -a "memory cpu growth"
+complete -c dev-cleaner -l mem-watch -d "Refresh memory and show growth" -x
 complete -c dev-cleaner -l list -d "List cleaner groups and exit"
+complete -c dev-cleaner -l sizes -d "Measure directory and Docker cache sizes (slower)"
 complete -c dev-cleaner -l size-jobs -d "Parallel sizing workers" -x
-complete -c dev-cleaner -l clean-jobs -d "Parallel delete workers" -x
+complete -c dev-cleaner -l clean-jobs -d "Parallel cleanup workers" -x
+complete -c dev-cleaner -l command-timeout -d "Cleanup command time limit in seconds" -x
 complete -c dev-cleaner -l config -d "Config path" -r -F
 complete -c dev-cleaner -l init -d "Interactive setup / write a starter config"
 complete -c dev-cleaner -l show-config -d "Print resolved config and exit"
@@ -459,17 +484,21 @@ def run(cmd: list[str], timeout: float = 60, **kw) -> subprocess.CompletedProces
         return None
 
 
-def dir_size(path: Path) -> int:
+def dir_size(path: Path) -> int | None:
     """Disk usage in bytes. Uses `du -sk` (fast, counts blocks) when available."""
     if shutil.which("du"):
-        r = run(["du", "-sk", str(path)], timeout=600)
+        r = run(["du", "-sk", str(path)], timeout=30)
         if r is not None and r.stdout.strip():
             try:
                 return int(r.stdout.split()[0]) * 1024
             except ValueError:
                 pass
+        return None  # Do not restart a timed-out du as an unbounded Python walk.
     total = 0
+    deadline = time.monotonic() + 30
     for dirpath, _, filenames in os.walk(path, followlinks=False):
+        if time.monotonic() >= deadline:
+            return None
         for f in filenames:
             try:
                 total += os.lstat(os.path.join(dirpath, f)).st_size
@@ -478,7 +507,7 @@ def dir_size(path: Path) -> int:
     return total
 
 
-def same_fs(path: Path, dev: int) -> bool:
+def same_fs(path: Path | str, dev: int) -> bool:
     """False across a mount point. ~/OrbStack, for one, is the docker VM's live filesystem."""
     try:
         return os.lstat(path).st_dev == dev
@@ -489,11 +518,11 @@ def same_fs(path: Path, dev: int) -> bool:
 def paths_size(paths: list[Path], workers: int) -> dict[Path, int]:
     """Disk usage of many paths at once: a few batched `du` calls instead of one each."""
     if not shutil.which("du"):
-        return {p: dir_size(p) for p in paths}
+        return {p: n for p in paths if (n := dir_size(p)) is not None}
 
     def batch(chunk: list[Path]) -> dict[Path, int]:
         out: dict[Path, int] = {}
-        r = run(["du", "-sk", *map(str, chunk)], timeout=1800)
+        r = run(["du", "-sk", *map(str, chunk)], timeout=30)
         for line in (r.stdout.splitlines() if r else ()):
             kb, _, name = line.partition("\t")
             if kb.isdigit():
@@ -543,13 +572,31 @@ def force_rmtree(path: Path) -> None:
         shutil.rmtree(path)
 
 
-def clear_dir(path: Path) -> None:
+class CleanupDeferred(RuntimeError):
+    """Partial or unverified cleanup: do not retry a busy backend during this run."""
+
+
+_cleanup_thread = local()
+
+
+def clear_dir(path: Path) -> str | None:
     """Remove a directory's contents but keep the directory itself."""
+    busy = 0
     for child in path.iterdir():
-        if child.is_dir() and not child.is_symlink():
-            force_rmtree(child)
-        else:
-            child.unlink()
+        try:
+            if child.is_dir() and not child.is_symlink():
+                force_rmtree(child)
+            else:
+                child.unlink()
+        except FileNotFoundError:  # another cleaner already removed it
+            continue
+        except OSError as error:
+            if error.errno not in (errno.ENOTEMPTY, errno.EBUSY):
+                raise
+            busy += 1
+    if busy:
+        raise CleanupDeferred(f"partially cleared; {busy} busy cache entries left in place (files changed during cleanup)")
+    return None
 
 
 def assert_deletable(path: Path, roots: list[Path]) -> None:
@@ -601,6 +648,9 @@ class Context:
     sweeps: list[Sweep] = field(default_factory=list)  # user-declared, from [[extra]]
     orphan_dirs: list[Path] = field(default_factory=list)  # from [procs], on top of the temp dirs
     warnings: list[str] = field(default_factory=list)
+    measure_active: bool = False     # deep --audit includes sizes of build dirs excluded by activity
+    command_timeout: float = 60
+    measure_sizes: bool = False      # recursive size reads are opt-in, never needed to clean
 
 
 # ---------------------------------------------------------------------------
@@ -608,7 +658,8 @@ class Context:
 # ---------------------------------------------------------------------------
 
 
-def find_projects(root: Path, extra_skip: set[str] | None = None):
+def find_projects(root: Path, extra_skip: set[str] | None = None, *,
+                  visit: Callable[[Path], None] | None = None):
     """Yield (group, project_dir, build_dir, BuildDir) for every build dir under root."""
     root = root.expanduser().resolve()
     skip = SKIP_DIRS | ALWAYS_PRUNE | (extra_skip or set())
@@ -617,31 +668,35 @@ def find_projects(root: Path, extra_skip: set[str] | None = None):
     except OSError:
         return
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        fset = set(filenames)
         here = Path(dirpath)
+        if visit is not None:
+            visit(here)
         matched: set[str] = set()
-        for rule in RULES:
-            if not rule.matches(fset):
-                continue
-            for bd in rule.dirs:
-                if bd.name not in dirnames or bd.name in matched:
+        if not ALL_BUILD_DIR_NAMES.isdisjoint(dirnames):
+            fset = set(filenames)
+            for rule in RULES:
+                if not rule.matches(fset):
                     continue
-                p = here / bd.name
-                if p.is_symlink() or not p.is_dir():
-                    continue
-                if bd.require and not (p / bd.require).exists():
-                    continue
-                matched.add(bd.name)
-                yield rule.group, here, p, bd
-        dirnames[:] = [d for d in dirnames if d not in skip and d not in matched and same_fs(here / d, dev)]
+                for bd in rule.dirs:
+                    if bd.name not in dirnames or bd.name in matched:
+                        continue
+                    p = here / bd.name
+                    if p.is_symlink() or not p.is_dir():
+                        continue
+                    if bd.require and not (p / bd.require).exists():
+                        continue
+                    matched.add(bd.name)
+                    yield rule.group, here, p, bd
+        dirnames[:] = [d for d in dirnames if d not in skip and d not in matched and same_fs(os.path.join(dirpath, d), dev)]
 
 
-def project_activity(project: Path) -> float:
+def project_activity(project: Path, cutoff: float | None = None) -> float:
     """Latest mtime across a project's sources, ignoring build dirs and VCS.
 
     Proxy for "when was this last worked on". Build-dir mtimes are useless:
     cargo rewrites target/.rustc_info.json on every invocation, node tooling
     touches node_modules/.cache, etc.
+    With a cutoff, stop as soon as one source proves the project is active.
     """
     prune = ALL_BUILD_DIR_NAMES | ALWAYS_PRUNE | {".git", ".hg", ".svn"}
     latest = 0.0
@@ -649,6 +704,8 @@ def project_activity(project: Path) -> float:
         latest = project.stat().st_mtime
     except OSError:
         pass
+    if cutoff is not None and latest >= cutoff:
+        return latest
     dev = os.stat(project).st_dev if project.exists() else 0
     for dirpath, dirnames, filenames in os.walk(project, followlinks=False):
         dirnames[:] = [d for d in dirnames if d not in prune and same_fs(Path(dirpath) / d, dev)]
@@ -657,6 +714,8 @@ def project_activity(project: Path) -> float:
                 m = os.lstat(os.path.join(dirpath, f)).st_mtime
                 if m > latest:
                     latest = m
+                if cutoff is not None and latest >= cutoff:
+                    return latest
             except OSError:
                 continue
     return latest
@@ -670,8 +729,16 @@ def scan_projects(ctx: Context, progress: Progress) -> list[Item]:
             console.print(f"[dim]skip[/] [yellow]{root}[/] (does not exist)")
             continue
         task = progress.add_task(f"scanning {tilde(root)}", detail="", total=None)
-        for group, project, build, bd in find_projects(root, ctx.extra_skip):
-            progress.update(task, detail=tilde(project))
+        visited = 0
+        last_update = 0.0
+        def visit(here: Path) -> None:
+            nonlocal visited, last_update
+            visited += 1
+            now = time.monotonic()
+            if now - last_update >= 0.1:
+                progress.update(task, description=f"scanning {tilde(root)} ({visited:,} dirs)", detail=tilde(here))
+                last_update = now
+        for group, project, build, bd in find_projects(root, ctx.extra_skip, visit=visit):
             if build in seen:
                 continue
             seen.add(build)
@@ -699,7 +766,7 @@ def scan_projects(ctx: Context, progress: Progress) -> list[Item]:
                              detail="", total=len(tops))
     activity: dict[Path, float] = {}
     with ThreadPoolExecutor(max_workers=ctx.size_jobs) as pool:
-        futs = {pool.submit(project_activity, t): t for t in tops}
+        futs = {pool.submit(project_activity, t, ctx.cutoff): t for t in tops}
         for fut in as_completed(futs):
             t = futs[fut]
             activity[t] = fut.result()
@@ -733,17 +800,44 @@ def _dir_item(group: str, label: str, path: Path, tier: str, note: str = "",
     return Item(group=group, label=label, path=path, tier=tier, note=note, mode=mode)
 
 
-def _cmd_action(cmd: list[str], timeout: float = 1800, cwd: Path | None = None,
+def _cmd_action(cmd: list[str], timeout: float = 60, cwd: Path | None = None,
                 summary: Callable[[str], str] | None = None) -> Callable[[], str | None]:
     def act() -> str | None:
-        r = run(cmd, timeout=timeout, cwd=cwd)
-        if r is None:
-            raise RuntimeError(f"{cmd[0]} failed to run")
-        if r.returncode != 0:
-            tail = (r.stderr or r.stdout).strip().splitlines()
-            raise RuntimeError(tail[-1] if tail else f"exit {r.returncode}")
-        out = r.stdout.strip()
-        return summary(out) if summary else None
+        # Put plugins/children (notably docker-buildx) in the same client group.
+        # Killing only the docker executable can leave its plugin running.
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                              cwd=cwd, start_new_session=True) as process:
+            deadline = time.monotonic() + timeout
+            try:
+                while True:
+                    cancelled = getattr(_cleanup_thread, "cancelled", None)
+                    if cancelled is not None and cancelled.is_set():
+                        raise CleanupDeferred("cancelled; client stopped, daemon work may still be running")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise CleanupDeferred(
+                            f"timed out after {timeout:g}s; client stopped, cleanup may be partial. "
+                            "A service/daemon request may still be running; later actions in this group are skipped")
+                    try:
+                        stdout, stderr = process.communicate(timeout=min(0.2, remaining))
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+            except (CleanupDeferred, KeyboardInterrupt):
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.communicate()
+                raise
+            if process.returncode != 0:
+                tail = (stderr or stdout).strip().splitlines()
+                if "directory not empty" in (stderr or stdout).lower():
+                    raise CleanupDeferred("cache changed during cleanup; some files remain. "
+                                          "Finish active builds before trying again")
+                raise RuntimeError(tail[-1] if tail else f"exit {process.returncode}")
+            out = stdout.strip()
+            return summary(out) if summary else None
     return act
 
 
@@ -780,12 +874,12 @@ def scan_go(ctx: Context) -> list[Item]:
     it = _dir_item("go", "go build cache", gocache, SAFE, "rebuilt on demand")
     if it:
         if go:
-            it.mode, it.action = "action", _cmd_action([go, "clean", "-cache"])
+            it.mode, it.action = "action", _cmd_action([go, "clean", "-cache"], timeout=ctx.command_timeout)
         items.append(it)
     it = _dir_item("go", "go module cache", gomod, AGGRESSIVE, "re-downloaded")
     if it:
         if go:
-            it.mode, it.action = "action", _cmd_action([go, "clean", "-modcache"])
+            it.mode, it.action = "action", _cmd_action([go, "clean", "-modcache"], timeout=ctx.command_timeout)
         items.append(it)
     return items
 
@@ -800,7 +894,7 @@ def scan_node_global(ctx: Context) -> list[Item]:
             items.append(Item(
                 group="node", label="pnpm store prune", path=store, size=None, tier=SAFE,
                 note="unreferenced packages only", mode="action", shadowed=True,
-                action=_cmd_action([pnpm, "store", "prune"], summary=lambda o: o.splitlines()[-1] if o else None),
+                action=_cmd_action([pnpm, "store", "prune"], timeout=ctx.command_timeout, summary=lambda o: o.splitlines()[-1] if o else None),
             ))
             it = _dir_item("node", "pnpm store", store, AGGRESSIVE, "re-downloaded; live projects keep hardlinks")
             if it:
@@ -823,12 +917,12 @@ def scan_python_global(ctx: Context) -> list[Item]:
             items.append(Item(
                 group="python", label="uv cache prune", path=uv_dir, tier=SAFE,
                 note="unreachable entries only", mode="action", shadowed=True,
-                action=_cmd_action([uv, "cache", "prune"], summary=lambda o: o.splitlines()[-1] if o else None),
+                action=_cmd_action([uv, "cache", "prune"], timeout=ctx.command_timeout, summary=lambda o: o.splitlines()[-1] if o else None),
             ))
         it = _dir_item("python", "uv cache", uv_dir, AGGRESSIVE, "wheels + sources; re-downloaded")
         if it:
             if uv:
-                it.mode, it.action = "action", _cmd_action([uv, "cache", "clean"])
+                it.mode, it.action = "action", _cmd_action([uv, "cache", "clean"], timeout=ctx.command_timeout)
             items.append(it)
     return items
 
@@ -862,22 +956,53 @@ def docker_vm_disks() -> list[tuple[str, Path]]:
     return [(name, p) for name, p in cands if p.is_file()]
 
 
-def _container_builders(docker: str) -> list[str]:
-    """buildx builders running in their own container: `docker system prune` never touches their cache."""
+def docker_endpoint(docker: str, context: str | None = None) -> str:
+    """Resolve named contexts too: a friendly context name may point at a remote host."""
+    if context is None:
+        context = os.environ.get("DOCKER_CONTEXT") or None
+        if context is None and os.environ.get("DOCKER_HOST"):
+            return os.environ["DOCKER_HOST"]
+    r = run([docker, "context", "inspect", *([context] if context else []),
+             "--format", "{{.Endpoints.docker.Host}}"], timeout=10)
+    return r.stdout.strip() if r and r.returncode == 0 else ""
+
+
+def _local_docker_endpoint(endpoint: str) -> bool:
+    return endpoint.startswith(("unix://", "npipe://"))
+
+
+def _buildx_builders(docker: str) -> list[dict]:
     r = run([docker, "buildx", "ls", "--format", "{{json .}}"], timeout=30)
-    names: list[str] = []
+    builders: dict[str, dict] = {}
     if r is None or r.returncode != 0:
-        return names
+        return []
     for line in r.stdout.splitlines():
         try:
             d = json.loads(line)
         except ValueError:
             continue
-        endpoints = [n.get("Endpoint") or "" for n in d.get("Nodes") or []]
-        remote = endpoints and all(e.startswith(("ssh://", "tcp://")) for e in endpoints)
-        if d.get("Driver") == "docker-container" and not remote and d.get("Name") not in names:
-            names.append(d["Name"])
-    return names
+        if isinstance(d, dict) and isinstance(d.get("Name"), str) and d["Name"]:
+            builders[d["Name"]] = d  # some buildx versions emit each builder more than once
+    return list(builders.values())
+
+
+def _builder_is_local(docker: str, builder: dict) -> bool:
+    endpoints = [n.get("Endpoint") or "" for n in builder.get("Nodes") or [] if isinstance(n, dict)]
+    if not endpoints:
+        return False
+    for endpoint in endpoints:
+        if not isinstance(endpoint, str) or not endpoint:
+            return False
+        resolved = endpoint if "://" in endpoint else docker_endpoint(docker, endpoint)
+        if not _local_docker_endpoint(resolved):
+            return False
+    return True
+
+
+def _container_builders(docker: str) -> list[str]:
+    """Local container builders: daemon-level pruning does not cover their caches."""
+    return list(dict.fromkeys(d["Name"] for d in _buildx_builders(docker)
+                              if d.get("Driver") == "docker-container" and _builder_is_local(docker, d)))
 
 
 def _buildx_reclaimable(docker: str, builder: str) -> int | None:
@@ -888,9 +1013,25 @@ def _buildx_reclaimable(docker: str, builder: str) -> int | None:
     return parse_size(m.group(1)) if m else None
 
 
+def _builder_cache_sizes(docker: str, names: list[str]) -> dict[str, int | None]:
+    with ThreadPoolExecutor(max_workers=PROBE_JOBS) as pool:
+        return dict(zip(names, pool.map(lambda name: _buildx_reclaimable(docker, name), names)))
+
+
+def _builder_inventory(docker: str) -> tuple[list[dict], dict[str, bool], dict[str, int | None]]:
+    builders = _buildx_builders(docker)
+    local = {b["Name"]: _builder_is_local(docker, b) for b in builders if b.get("Driver") == "docker-container"}
+    running = [b["Name"] for b in builders if local.get(b["Name"]) and
+               any(n.get("Status") == "running" for n in b.get("Nodes") or [] if isinstance(n, dict))]
+    return builders, local, _builder_cache_sizes(docker, running)
+
+
 def scan_docker(ctx: Context) -> list[Item]:
     docker = shutil.which("docker")
     if not docker:
+        return []
+    if not _local_docker_endpoint(docker_endpoint(docker)):
+        ctx.warnings.append("docker: endpoint is remote or could not be verified as local — skipped")
         return []
     held = ", ".join(f"{human_size(sz)} in the {name} VM disk" for name, sz in
                      ((name, file_disk_size(p)) for name, p in docker_vm_disks()) if sz >= 10 * 1024**3)
@@ -900,17 +1041,17 @@ def scan_docker(ctx: Context) -> list[Item]:
                             + (f" ({held}; start it and re-run)" if held else ""))
         return []
     if held:
-        ctx.warnings.append(f"docker: {held} — the file shrinks as images, volumes and build cache go")
+        ctx.warnings.append(f"docker: {held} — cleanup inside the VM may not immediately shrink the host file")
 
-    df = _docker_df(docker)
-    if not df:
+    df = _docker_df(docker) if ctx.measure_sizes else {}
+    if ctx.measure_sizes and not df:
         ctx.warnings.append("docker: `docker system df` failed — some sizes unknown")
 
     def reclaimable(t: str) -> int | None:
         return parse_size(df[t]["Reclaimable"]) if t in df else None
 
     dangling = None
-    r = run([docker, "images", "-f", "dangling=true", "--format", "{{.Size}}"], timeout=30)
+    r = run([docker, "images", "-f", "dangling=true", "--format", "{{.Size}}"], timeout=30) if ctx.measure_sizes else None
     if r and r.returncode == 0:
         dangling = sum(parse_size(l) or 0 for l in r.stdout.splitlines() if l.strip())
 
@@ -924,7 +1065,7 @@ def scan_docker(ctx: Context) -> list[Item]:
         # Unknown is not zero: a failed `system df` must not hide the row.
         if size is None or size > 0:
             items.append(Item(group="docker", label=label, size=size, tier=tier, note=note, mode="action",
-                              action=_cmd_action([docker, *args], summary=summarize)))
+                              action=_cmd_action([docker, *args], timeout=ctx.command_timeout, summary=summarize)))
 
     items: list[Item] = []
     containers = reclaimable("Containers")
@@ -932,14 +1073,16 @@ def scan_docker(ctx: Context) -> list[Item]:
           "stopped containers, dangling images, unused networks", "system", "prune", "-f")
 
     cache = reclaimable("Build Cache")
-    if cache is None:
+    if cache is None and ctx.measure_sizes:
         ctxname = run([docker, "context", "show"], timeout=15)
         if ctxname and ctxname.returncode == 0 and ctxname.stdout.strip():
             cache = _buildx_reclaimable(docker, ctxname.stdout.strip())
     prune("docker builder prune -a", cache, SAFE, "build cache; rebuilt on demand",
           "builder", "prune", "-a", "-f")
-    for name in _container_builders(docker):
-        prune(f"docker buildx prune ({name})", _buildx_reclaimable(docker, name), SAFE,
+    builders = _container_builders(docker)
+    caches = _builder_cache_sizes(docker, builders) if ctx.measure_sizes else dict.fromkeys(builders)
+    for name, size in caches.items():
+        prune(f"docker buildx prune ({name})", size, SAFE,
               "build cache of a container builder; rebuilt on demand",
               "buildx", "prune", "--builder", name, "-a", "-f")
 
@@ -963,6 +1106,119 @@ def scan_docker(ctx: Context) -> list[Item]:
     return items
 
 
+def run_docker_audit() -> bool:
+    """Read-only Docker disk/cache and container-memory inventory for a local daemon."""
+    docker = shutil.which("docker")
+    if not docker:
+        console.print("[yellow]docker audit: docker is not installed[/]")
+        return False
+    endpoint = docker_endpoint(docker)
+    if not _local_docker_endpoint(endpoint):
+        console.print(Text("docker audit: endpoint is remote or could not be verified as local — skipped", style="yellow"))
+        return False
+    console.print(Text(f"Docker endpoint: {endpoint}", style="dim"))
+    for name, disk in docker_vm_disks():
+        console.print(Text(f"{name} VM disk: {human_size(file_disk_size(disk))} allocated on the host — {tilde(disk)}"))
+    info = run([docker, "info", "--format", "{{.MemTotal}}"], timeout=15)
+    if not info or info.returncode != 0:
+        console.print("[yellow]docker audit: daemon not reachable; start the runtime and try again[/]")
+        return False
+    if info.stdout.strip().isdigit():
+        console.print(Text(f"RAM visible to the Docker daemon: {human_size(int(info.stdout.strip()))} "
+                           "(capacity, not host memory consumption)"))
+
+    # The daemon's disk accounting and each builder may be slow independently.
+    # Keep rendering on this thread and overlap only read-only probes.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        pending = {pool.submit(_docker_df, docker): "disk usage",
+                   pool.submit(run, [docker, "stats", "--no-stream", "--format", "{{json .}}"], timeout=20): "container memory",
+                   pool.submit(_builder_inventory, docker): "builder caches"}
+        results = {}
+        with console.status("Reading Docker disk, memory and builder caches in parallel…") as status:
+            for future in as_completed(pending):
+                name = pending[future]
+                try:
+                    results[name] = future.result()
+                except Exception:
+                    results[name] = None
+                remaining = [label for label in pending.values() if label not in results]
+                status.update("Waiting for " + ", ".join(remaining) + "…")
+    df = results["disk usage"] or {}
+    stats = results["container memory"]
+    builders, local, caches = results["builder caches"] or ([], {}, {})
+    table = Table(title="🐳  Docker disk usage (daemon)", box=ROUNDED, title_justify="left", expand=True)
+    for label in ("resource", "total", "active", "size", "reclaimable"):
+        table.add_column(label)
+    for kind, values in df.items():
+        table.add_row(*[Text(str(v)) for v in (kind, values.get("TotalCount", "?"), values.get("Active", "?"),
+                                              values.get("Size", "?"), values.get("Reclaimable", "?"))])
+    console.print(table)
+    if not df:
+        console.print("[yellow]Daemon disk usage unavailable; builder caches may still be measurable.[/]")
+
+    containers = []
+    if stats and stats.returncode == 0:
+        for line in stats.stdout.splitlines():
+            try:
+                d = json.loads(line)
+                mem = parse_size(str(d.get("MemUsage", "")).split("/", 1)[0], base=1024)
+                if mem is not None:
+                    containers.append((d, mem))
+            except (ValueError, AttributeError):
+                continue
+        table = Table(title="🧠  running containers", box=ROUNDED, title_justify="left", expand=True)
+        table.add_column("memory", justify="right")
+        table.add_column("CPU %", justify="right")
+        table.add_column("container")
+        for d, mem in sorted(containers, key=lambda row: -row[1]):
+            table.add_row(human_size(mem), Text(str(d.get("CPUPerc", "?"))), Text(str(d.get("Name", d.get("ID", "?")))))
+        console.print(table)
+        console.print(Text(f"Reported container memory: {human_size(sum(mem for _, mem in containers))} "
+                           f"across {len(containers)} container(s). Compare with VM processes in --mem-tree.", style="dim"))
+    else:
+        console.print("[yellow]Container memory stats unavailable.[/]")
+    console.print(Text("Container stats and host VM footprint use different accounting; their difference is not all VM overhead. "
+                       "Guest caches and services also use memory.", style="dim"))
+
+    table = Table(title="🏗️  buildx builders and container-builder caches", box=ROUNDED,
+                  title_justify="left", expand=True)
+    for label in ("builder", "driver / status", "last activity", "reclaimable", "endpoint / notes"):
+        table.add_column(label, overflow="fold")
+    measured = []
+    for builder in builders:
+        name = builder["Name"]
+        nodes = [n for n in builder.get("Nodes") or [] if isinstance(n, dict)]
+        statuses = ", ".join(sorted({str(n.get("Status", "unknown")) for n in nodes})) or "unknown"
+        endpoints = ", ".join(str(n.get("Endpoint", "?")) for n in nodes)
+        driver = builder.get("Driver", "unknown")
+        cache = None
+        if driver != "docker-container":
+            note = "daemon-managed cache; inspect its context" if driver == "docker" else "not a container builder"
+        elif not local.get(name):
+            note = "remote or unverified; not queried"
+        elif not any(n.get("Status") == "running" for n in nodes):
+            note = "not running; cache not queried"
+        else:
+            cache = caches.get(name)
+            note = "cache rebuilt on demand" if cache is not None else "cache query unavailable"
+        if cache is not None:
+            measured.append(cache)
+        table.add_row(*[Text(str(value)) for value in (
+            name, f"{driver} / {statuses}", builder.get("LastActivity") or "unknown", human_size(cache),
+            f"{endpoints}; {note}")])
+    console.print(table)
+    if not builders:
+        console.print("[yellow]No buildx builders reported (buildx may be unavailable).[/]")
+    console.print(Text(f"Measured container-builder reclaimable cache: {human_size(sum(measured) if measured else None)} "
+                       f"from {len(measured)} builder(s); unmeasured caches excluded. "
+                       "These estimates are not added to the daemon or VM disk totals.", style="dim"))
+    console.print(Text("Builder status and last activity do not prove a builder is unused. Cache pruning causes rebuilds; "
+                       "removing a builder also removes its configuration. Restarting the VM interrupts all its workloads. "
+                       "Deleting volumes can remove persistent data.", style="dim"))
+    console.print("[dim]Preview cleanup: dev-cleaner --only docker --dry-run[/]")
+    return True
+
+
 def scan_brew(ctx: Context) -> list[Item]:
     brew = shutil.which("brew")
     if not brew:
@@ -981,7 +1237,7 @@ def scan_brew(ctx: Context) -> list[Item]:
         items.append(Item(
             group="brew", label="brew cleanup --prune=all", size=size or 0, tier=SAFE,
             note="old versions, downloads, logs", mode="action",
-            action=_cmd_action([brew, "cleanup", "-s", "--prune=all"], timeout=900,
+            action=_cmd_action([brew, "cleanup", "-s", "--prune=all"], timeout=ctx.command_timeout,
                                summary=lambda o: f"removed {sum(1 for l in o.splitlines() if l.startswith('Removing'))} item(s)"),
         ))
     r = run([brew, "autoremove", "-n"], timeout=120)
@@ -991,7 +1247,7 @@ def scan_brew(ctx: Context) -> list[Item]:
             group="brew", label="brew autoremove", size=None, tier=AGGRESSIVE,
             note=f"{len(formulae)} formula(e) no longer needed by anything: "
                  + ", ".join(formulae[:6]) + (" …" if len(formulae) > 6 else ""),
-            mode="action", action=_cmd_action([brew, "autoremove"], timeout=600),
+            mode="action", action=_cmd_action([brew, "autoremove"], timeout=ctx.command_timeout),
         ))
     return items
 
@@ -1017,7 +1273,7 @@ def scan_xcode(ctx: Context) -> list[Item]:
         items.append(Item(
             group="xcode", label="simctl delete unavailable", size=None, tier=SAFE,
             note="simulators whose runtime is gone", mode="action",
-            action=_cmd_action([xcrun, "simctl", "delete", "unavailable"], timeout=300),
+            action=_cmd_action([xcrun, "simctl", "delete", "unavailable"], timeout=ctx.command_timeout),
         ))
     return items
 
@@ -1163,12 +1419,13 @@ def scan_sweeps(sweeps: list[Sweep], ctx: Context) -> list[Item]:
                     stale.append(p)
         if not stale:
             continue
-        sizes = paths_size(stale, ctx.size_jobs)
+        sizes = paths_size(stale, ctx.size_jobs) if ctx.measure_sizes else {}
         top = sorted(sizes.items(), key=lambda kv: -kv[1])[:3]
         note = f"{len(stale)} entries" + (
             "; biggest: " + ", ".join(f"{p.name[:28]} {human_size(n)}" for p, n in top) if top else "")
         items.append(Item(
-            group=sw.group, label=sw.label, path=sw.path, size=sum(sizes.values()), tier=SAFE,
+            group=sw.group, label=sw.label, path=sw.path,
+            size=sum(sizes.values()) if len(sizes) == len(stale) else None, tier=SAFE,
             note=f"{sw.note}; {note}" if sw.note else note, mode="action",
             action=_sweep_action(stale, cutoff),
         ))
@@ -1194,13 +1451,19 @@ class Proc:
     ppid: int
     uid: int
     age: float                       # seconds since start
-    cpu: float                       # % right now
+    cpu: float                       # ps CPU average; not an instantaneous measurement
     mem: int                         # bytes: footprint incl. compressed/swapped where known, else RSS
     exe: str
+    started: str = ""                # ps lstart: distinguish recycled PIDs between snapshots
+    footprint: bool = False          # macOS top supplied MEM; otherwise mem is RSS
 
     @property
     def name(self) -> str:
         return os.path.basename(self.exe)
+
+    @property
+    def identity(self) -> tuple[int, int, str, str]:
+        return self.pid, self.uid, self.exe, self.started
 
 
 def parse_etime(s: str) -> float:
@@ -1216,34 +1479,36 @@ def _footprints() -> dict[int, int]:
     """pid → memory footprint. RSS collapses once a machine swaps, which is exactly when this matters."""
     if not IS_MAC:
         return {}
-    r = run(["top", "-l", "1", "-n", "100000", "-stats", "pid,mem"], timeout=60)
+    r = run(["top", "-l", "1", "-n", "100000", "-stats", "pid,mem"], timeout=60,
+            env={**os.environ, "LC_ALL": "C"})
     out: dict[int, int] = {}
     for line in (r.stdout.splitlines() if r and r.returncode == 0 else ()):
-        m = re.fullmatch(r"\s*(\d+)\s+(\d+)([BKMG])[+-]?\s*", line)
+        m = re.fullmatch(r"\s*(\d+)\s+(\d+(?:\.\d+)?)([BKMGTP])[+-]?\s*", line)
         if m:
-            out[int(m.group(1))] = int(m.group(2)) * 1024 ** "BKMG".index(m.group(3))
+            out[int(m.group(1))] = int(float(m.group(2)) * 1024 ** "BKMGTP".index(m.group(3)))
     return out
 
 
 def list_procs() -> list[Proc]:
-    r = run(["ps", "-A", "-o", "pid=,ppid=,uid=,etime=,%cpu=,rss=,comm="], timeout=30)
+    r = run(["ps", "-A", "-ww", "-o", "pid=,ppid=,uid=,etime=,%cpu=,rss=,lstart=,comm="], timeout=30,
+            env={**os.environ, "LC_ALL": "C"})
     if r is None or r.returncode != 0:
         return []
     foot = _footprints()
     procs = []
     for line in r.stdout.splitlines():
-        f = line.split(None, 6)
-        if len(f) < 7:
+        f = line.split(None, 11)
+        if len(f) < 12:
             continue
         try:
-            pid, exe = int(f[0]), f[6].strip()
+            pid, exe = int(f[0]), f[11].strip()
             if not IS_MAC:  # Linux `comm` is a bare, truncated name
                 try:
                     exe = os.readlink(f"/proc/{pid}/exe")
                 except OSError:
                     pass
             procs.append(Proc(pid, int(f[1]), int(f[2]), parse_etime(f[3]), float(f[4].replace(",", ".")),
-                              foot.get(pid, int(f[5]) * 1024), exe))
+                              foot.get(pid, int(f[5]) * 1024), exe, " ".join(f[6:11]), pid in foot))
         except ValueError:
             continue
     return procs
@@ -1277,8 +1542,9 @@ def _name_counts(procs: list[Proc], n: int = 5) -> str:
 def _stop_action(targets: list[Proc], roots: tuple[str, ...], min_age: float) -> Callable[[], str | None]:
     def act() -> str | None:
         # Pids get recycled and orphans get adopted: only signal what still qualifies.
-        want = {(p.pid, p.exe) for p in targets}
-        live = [p for p in find_orphans(list_procs(), roots, min_age) if (p.pid, p.exe) in want]
+        want = {p.identity for p in targets}
+        live = [p for p in find_orphans(list_procs(), roots, min_age)
+                if p.identity in want]
 
         def alive(p: Proc) -> bool:
             try:
@@ -1299,6 +1565,10 @@ def _stop_action(targets: list[Proc], roots: tuple[str, ...], min_age: float) ->
         while time.time() < deadline and any(alive(p) for p in live):
             time.sleep(0.25)
         stuck = [p for p in live if alive(p)]
+        if stuck:
+            # A parent may exit during the grace period and its PID be reused.
+            identities = {p.identity for p in list_procs()}
+            stuck = [p for p in stuck if p.identity in identities]
         send(stuck, signal.SIGKILL)
         return f"stopped {len(live)}" + (f" ({len(stuck)} forced)" if stuck else "")
     return act
@@ -1316,53 +1586,218 @@ def scan_procs(ctx: Context) -> list[Item]:
     )]
 
 
-def run_mem(ctx: Context) -> None:
-    """Read-only: what holds the memory, and how much of it is leaked."""
-    procs = list_procs()
-    if not procs:
-        console.print("[yellow]mem: could not list processes[/]")
-        return
-    if IS_MAC:
-        swap = run(["sysctl", "-n", "vm.swapusage"], timeout=10)
-        m = re.search(r"total = ([\d.]+M)\s+used = ([\d.]+M)", swap.stdout) if swap else None
-        if m:
-            total, used = (parse_size(x + "B", base=1024) or 0 for x in m.groups())
-            style = "red bold" if total and used / total > 0.5 else "green"
-            console.print(Text.from_markup(
-                f"  [dim]swap:[/] [{style}]{human_size(used)}[/] [dim]of {human_size(total)} in use"
-                + (" — the machine is out of RAM; the kernel burns CPU compressing and paging[/]"
-                   if style != "green" else "[/]")))
-    by_name: dict[str, list[Proc]] = defaultdict(list)
-    for p in procs:
-        by_name[p.name].append(p)
-    rows = sorted(by_name.items(), key=lambda kv: -sum(p.mem for p in kv[1]))
+def system_memory() -> dict[str, int]:
+    """Best-effort host counters; unknown values stay unknown, never zero-filled."""
+    out: dict[str, int] = {}
+    if not IS_MAC:
+        try:
+            fields = {}
+            for line in Path("/proc/meminfo").read_text().splitlines():
+                key, value = line.split(":", 1)
+                fields[key] = int(value.split()[0]) * 1024
+            for key, label in (("MemTotal", "RAM"), ("MemAvailable", "available")):
+                if key in fields:
+                    out[label] = fields[key]
+            if "SwapTotal" in fields and "SwapFree" in fields:
+                out.update(swap_total=fields["SwapTotal"], swap_used=fields["SwapTotal"] - fields["SwapFree"])
+        except (OSError, ValueError, IndexError):
+            pass
+        return out
+    total = run(["sysctl", "-n", "hw.memsize"], timeout=5)
+    if total and total.returncode == 0 and total.stdout.strip().isdigit():
+        out["RAM"] = int(total.stdout.strip())
+    vm = run(["vm_stat"], timeout=5)
+    if vm and vm.returncode == 0:
+        page = re.search(r"page size of (\d+) bytes", vm.stdout)
+        compressed = re.search(r"^Pages occupied by compressor:\s+(\d+)", vm.stdout, re.M)
+        if page and compressed:
+            out["compressed"] = int(page[1]) * int(compressed[1])
+    swap = run(["sysctl", "-n", "vm.swapusage"], timeout=5)
+    if swap and swap.returncode == 0:
+        for key, label in (("total", "swap_total"), ("used", "swap_used")):
+            m = re.search(rf"{key} = ([\d.]+[KMGT])", swap.stdout)
+            if m:
+                value = parse_size(m[1] + "B", base=1024)
+                if value is not None:
+                    out[label] = value
+    return out
 
-    table = Table(title="[bold]🧠  where the memory went[/] [dim](by program)[/]", box=ROUNDED,
-                  border_style="magenta", header_style="bold magenta", title_justify="left", expand=True)
-    table.add_column("memory", justify="right", min_width=9)
-    table.add_column("procs", justify="right")
-    table.add_column("idle >1d", justify="right")
-    table.add_column("oldest", justify="right")
-    table.add_column("program", overflow="fold")
-    for name, ps_ in rows[:20]:
-        mem = sum(p.mem for p in ps_)
-        if mem < 256 * 1024**2:
-            break
-        old = sum(1 for p in ps_ if p.age >= 86400 and p.cpu <= 1.0)
-        days = max(p.age for p in ps_) / 86400
-        table.add_row(Text(human_size(mem), style=size_color(mem)), str(len(ps_)),
-                      Text(str(old), style="yellow" if old >= 5 else "dim") if old else Text("—", style="dim"),
-                      Text(f"{days:.1f}d", style=age_color(days) if len(ps_) > 1 else "dim"), name)
-    console.print()
-    console.print(table)
-    orphans = find_orphans(procs, orphan_roots(ctx), time.time() - ctx.cutoff)
+
+def process_commands() -> dict[int, str]:
+    """Arguments help distinguish node/python servers and agent sessions."""
+    r = run(["ps", "-A", "-ww", "-o", "pid=,args="], timeout=10)
+    out = {}
+    for line in (r.stdout.splitlines() if r and r.returncode == 0 else ()):
+        fields = line.strip().split(None, 1)
+        if len(fields) == 2 and fields[0].isdigit():
+            out[int(fields[0])] = fields[1]
+    return out
+
+
+def group_procs(procs: list[Proc], by_tree: bool = False) -> list[tuple[Proc, list[Proc]]]:
+    """Group by full executable or by same-owner ancestry below init/service managers."""
+    by_pid = {p.pid: p for p in procs}
+    groups: dict[str | int, list[Proc]] = defaultdict(list)
+    representatives = {}
+    for p in procs:
+        root = p
+        if by_tree:
+            chain: list[int] = []
+            seen: set[int] = set()
+            while root.pid not in seen:
+                seen.add(root.pid)
+                chain.append(root.pid)
+                parent = by_pid.get(root.ppid)
+                if (root.ppid <= 1 or parent is None or parent.uid != root.uid
+                        or parent.name in {"systemd", "launchd", "init"}):
+                    break
+                root = parent
+            else:  # a process-table race or malformed snapshot must not loop forever
+                root = by_pid[min(chain[chain.index(root.pid):])]
+        key = root.pid if by_tree else p.exe
+        groups[key].append(p)
+        representatives[key] = root
+    return [(representatives[key], members) for key, members in groups.items()]
+
+
+def memory_deltas(procs: list[Proc], previous: list[Proc]) -> dict[int, int]:
+    """Compare the same process and metric; PID reuse or RSS fallback is not growth."""
+    old = {(p.identity, p.footprint): p.mem for p in previous}
+    return {p.pid: p.mem - old[key] for p in procs
+            if (key := (p.identity, p.footprint)) in old}
+
+
+def _memory_change(delta: int | None, new: bool = False) -> Text:
+    if delta is None:
+        return Text("new" if new else "—", style="dim")
+    if not delta:
+        return Text("—", style="dim")
+    return Text(("+" if delta > 0 else "−") + human_size(abs(delta)), style="yellow" if delta > 0 else "green")
+
+
+def render_memory(procs: list[Proc], ctx: Context, *, previous: list[Proc] | None = None,
+                  commands: dict[int, str] | None = None, top: int = 10, pattern: str = "",
+                  by_tree: bool = False, sort: str = "memory", elapsed: float | None = None,
+                  full: bool = False) -> Group:
+    commands = commands or {}
+    needle = pattern.casefold()
+    # Family filtering keeps descendants: the server may hold more RAM than its agent.
+    groups = group_procs(procs, by_tree)
+    if needle:
+        def matches(p: Proc) -> bool:
+            return needle in f"{p.pid} {p.exe} {commands.get(p.pid, '')}".casefold()
+        if by_tree:
+            groups = [(root, members) for root, members in groups if any(matches(p) for p in members)]
+        else:
+            groups = [(root, [p for p in members if matches(p)]) for root, members in groups]
+        groups = [(root, members) for root, members in groups if members]
+    selected = [p for _, members in groups for p in members]
+    deltas = memory_deltas(procs, previous) if previous is not None else {}
+    old_ids = {p.identity for p in previous} if previous is not None else set()
+
+    def score(members: list[Proc]) -> float:
+        if sort == "cpu":
+            return sum(p.cpu for p in members)
+        if sort == "growth":
+            return sum(deltas.get(p.pid, 0) for p in members)
+        return sum(p.mem for p in members)
+
+    groups.sort(key=lambda row: (-score(row[1]), -sum(p.mem for p in row[1]), row[0].pid))
+    selected.sort(key=lambda p: (-score([p]), -p.mem, p.pid))
+    orphans = find_orphans(procs, orphan_roots(ctx), max(0, time.time() - ctx.cutoff))
+    orphan_ids = {p.pid for p in orphans}
+    tree_members = {p.pid: members for p, members in group_procs(procs, True)}
+    parts: list = []
+    status = system_memory()
+    counters = [f"{key}: {human_size(status[key])}" for key in ("RAM", "available", "compressed") if key in status]
+    if "swap_used" in status:
+        counters.append(f"swap: {human_size(status['swap_used'])} / {human_size(status.get('swap_total'))}")
+    parts.append(Text("  ".join(counters) or "Host memory counters unavailable", style="bold"))
+    if status.get("swap_used", 0):
+        parts.append(Text("Swap use alone does not prove current pressure; watch growth and system responsiveness.", style="dim"))
+    sources = sum(p.footprint for p in procs)
+    metric = ("macOS footprint" if sources == len(procs) else
+              f"macOS footprint ({sources} PIDs), RSS fallback ({len(procs) - sources} PIDs)" if sources else "RSS")
+    parts.append(Text(f"{time.strftime('%H:%M:%S')}  •  {len(selected)} / {len(procs)} processes  •  memory: {metric}", style="dim"))
+    parts.append(Text("CPU is the ps average. Process memory can share pages; totals are estimates, not reclaimable RAM.", style="dim"))
+    if previous is not None:
+        parts.append(Text(f"Δ over {elapsed:.1f}s; surviving PIDs only. New processes show ‘new’; exits are excluded."
+                          if elapsed is not None else "Δ compares surviving PIDs only; exits are excluded.", style="dim"))
+
+    table = Table(title="🧠  memory by " + ("process family" if by_tree else "program (reported executable)"),
+                  box=ROUNDED, border_style="magenta", title_justify="left", expand=True)
+    for label in ("memory", "Δ", "CPU %", "procs", "old/low"):
+        table.add_column(label, justify="right")
+    table.add_column("root PID" if by_tree else "top PID", justify="right")
+    table.add_column("program", overflow="fold" if full else "ellipsis", no_wrap=not full, ratio=2)
+    min_age = max(0, time.time() - ctx.cutoff)
+    for root, members in groups[:top]:
+        mem = sum(p.mem for p in members)
+        matched = [deltas[p.pid] for p in members if p.pid in deltas]
+        change = sum(matched) if matched else None
+        old = sum(p.age >= min_age and p.cpu <= 1 for p in members)
+        shown_pid = root.pid if by_tree else max(members, key=lambda p: p.mem).pid
+        table.add_row(Text(human_size(mem), style=size_color(mem)),
+                      _memory_change(change, previous is not None and all(p.identity not in old_ids for p in members)),
+                      f"{sum(p.cpu for p in members):.1f}", str(len(members)), str(old), str(shown_pid),
+                      Text(tilde(root.exe) if full or root.exe == root.name else f"{root.name} ({tilde(root.exe)})"))
+    if not selected:
+        parts.append(Text(f"No processes match {pattern!r}." if pattern else "No processes found.", style="yellow"))
+    parts.append(table)
+    parts.append(Text(f"Showing {min(top, len(groups))} / {len(groups)} groups. Old / low CPU means age ≥ "
+                      f"{min_age / 86400:.2g}d and ps CPU ≤1%; it does not establish inactivity or a leak.", style="dim"))
+    detail = Table(title="🔎  individual processes (same sort and filter)", box=ROUNDED,
+                   border_style="magenta", title_justify="left", expand=True)
+    for label in ("PID", "PPID", "memory", "Δ", "CPU %", "age"):
+        detail.add_column(label, justify="right")
+    detail.add_column("owner", overflow="fold" if full else "ellipsis", no_wrap=not full)
+    detail.add_column("command", overflow="fold" if full else "ellipsis", no_wrap=not full, ratio=2)
+    for p in selected[:top]:
+        hints = "mine" if p.uid == os.getuid() else f"uid {p.uid}"
+        if p.pid in orphan_ids:
+            hints += "; orphan candidate"
+        command = commands.get(p.pid, p.exe)
+        if not full and command.startswith(p.exe):
+            command = p.name + command[len(p.exe):]
+        detail.add_row(str(p.pid), str(p.ppid), Text(human_size(p.mem), style=size_color(p.mem)),
+                       _memory_change(deltas.get(p.pid), previous is not None and p.identity not in old_ids),
+                       f"{p.cpu:.1f}", f"{p.age / 86400:.1f}d", Text(hints),
+                       Text(tilde(command)))
+    parts.append(detail)
     if orphans:
-        console.print(Text.from_markup(
-            f"[yellow]![/] [bold]{len(orphans)}[/] [dim]orphaned process(es) holding[/] "
-            f"[bold]{human_size(sum(p.mem for p in orphans))}[/][dim]: {escape(_name_counts(orphans))}. "
-            f"stop them with[/] [bold]dev-cleaner --only procs[/]"))
-    console.print("[dim]many old idle copies of one program (agent sessions, language servers) are sessions "
-                  "nobody closed: close them where they were opened.[/]")
+        # Descendants may hold most of the memory (e.g. a postgres agent's server).
+        related = {q.pid: q for p in orphans for q in tree_members.get(p.pid, [p])}
+        parts.append(Text(f"Across all processes: {len(orphans)} configured orphan candidate(s): {human_size(sum(p.mem for p in orphans))}; "
+                          f"with same-owner descendants: {len(related)} processes, "
+                          f"{human_size(sum(p.mem for p in related.values()))}. Preview: dev-cleaner --only procs --dry-run",
+                          style="yellow"))
+        parts.append(Text("Cleanup targets the qualifying parents; children depend on their shutdown behavior. "
+                          "PPID 1 alone does not mean a process is abandoned.", style="dim"))
+    parts.append(Text("Use --mem-tree for app/session totals, --mem-filter TEXT to narrow down, "
+                      "and --mem-watch 5 --mem-sort growth to track growth. Read-only; Ctrl-C stops watching.", style="dim"))
+    return Group(*parts)
+
+
+def run_mem(ctx: Context, *, top: int = 10, pattern: str = "", by_tree: bool = False,
+            sort: str = "memory", watch: float | None = None, full: bool = False) -> bool:
+    """Read-only snapshots, optionally refreshed with per-process memory deltas."""
+    previous = None
+    sampled_at = None
+    while True:
+        procs = list_procs()
+        now = time.monotonic()
+        if not procs:
+            console.print("[yellow]mem: could not list processes[/]")
+            return False
+        if watch and console.is_terminal:
+            console.clear()
+        console.print(render_memory(procs, ctx, previous=previous, commands=process_commands(), top=top,
+                                    pattern=pattern, by_tree=by_tree, sort=sort,
+                                    elapsed=now - sampled_at if sampled_at is not None else None, full=full))
+        if watch is None:
+            return True
+        previous, sampled_at = procs, now
+        time.sleep(watch)
 
 
 GLOBAL_SCANNERS: dict[str, Callable[[Context], list[Item]]] = {
@@ -1411,20 +1846,54 @@ GROUP_HELP: dict[str, tuple[str, str]] = {
 # ---------------------------------------------------------------------------
 
 
+def _status_table() -> Table:
+    """One physical terminal line per row, even with very long paths/errors."""
+    table = Table.grid(expand=True, padding=(0, 1))
+    table.add_column(width=11, no_wrap=True, overflow="ellipsis")
+    table.add_column(width=10, no_wrap=True, overflow="ellipsis")
+    table.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+    return table
+
+
+def _elapsed(seconds: float) -> str:
+    minutes, seconds = divmod(max(0, int(seconds)), 60)
+    return f"{minutes}:{seconds:02d}"
+
+
+class ScanProgress(Progress):
+    """Keep discovery, tool checks and sizing anchored to three reserved rows."""
+
+    def get_renderables(self):
+        buckets = {name: [] for name in ("Projects", "Tools", "Sizes")}
+        for task in self.tasks:
+            category = ("Tools" if task.description.startswith("checking ") else
+                        "Sizes" if task.description.startswith("sizing ") else "Projects")
+            buckets[category].append(task)
+        table = _status_table()
+        for category, tasks in buckets.items():
+            if not tasks:
+                table.add_row(Text(category, style="bold"), Text("—", style="dim"), Text("", style="dim"))
+                continue
+            elapsed = max(task.elapsed or 0 for task in tasks)
+            if category == "Tools":
+                label = ", ".join(task.description.removeprefix("checking ") for task in tasks)
+            else:
+                task = tasks[-1]
+                count = f" {int(task.completed)}/{int(task.total)}" if task.total is not None else ""
+                label = f"{task.description}{count}  {task.fields.get('detail', '')}"
+            table.add_row(Text(category, style="bold"), Text(_elapsed(elapsed), style="dim"), Text(label))
+        yield table
+
+
 def make_progress() -> Progress:
-    return Progress(
-        SpinnerColumn(style="magenta"),
-        TextColumn("[bold]{task.description}"),
-        TextColumn("[dim]{task.fields[detail]}"),
-        TimeElapsedColumn(),
-        console=console,
-        transient=True,
-    )
+    return ScanProgress(console=console, transient=True, refresh_per_second=4, disable=not console.is_terminal)
 
 
-def size_items(items: list[Item], workers: int, progress: Progress) -> None:
+def size_items(items: list[Item], workers: int, progress: Progress, cutoff: float | None = None) -> None:
     # Shadowed prune-style items (pnpm/uv prune) stay "?" — the whole dir size would overstate them.
-    todo = [i for i in items if i.size is None and i.path is not None and not i.shadowed]
+    todo = [i for i in items if i.size is None and i.path is not None and not i.shadowed
+            and i.group not in {"tmp", "extra"}  # sweeps measure selected entries, not their whole parent
+            and not (cutoff is not None and i.is_project and i.mtime is not None and i.mtime >= cutoff)]
     if not todo:
         return
     task = progress.add_task(f"sizing {len(todo)} dir(s)", detail="", total=len(todo))
@@ -1443,20 +1912,36 @@ def size_items(items: list[Item], workers: int, progress: Progress) -> None:
 
 def scan_all(ctx: Context) -> list[Item]:
     items: list[Item] = []
+
+    def probe(name: str, fn: Callable[[Context], list[Item]]) -> tuple[list[Item], list[str]]:
+        # Keep warning buffers private; merge results in the familiar group order.
+        local_ctx = replace(ctx, warnings=[])
+        try:
+            found = fn(local_ctx)
+        except Exception as e:  # one broken tool must not sink the run
+            found = []
+            local_ctx.warnings.append(f"{name}: scan failed ({e}) — skipped")
+        return found, local_ctx.warnings
+
     with make_progress() as progress:
-        if ctx.groups & set(PROJECT_GROUPS):
-            items += scan_projects(ctx, progress)
-        for name, fn in GLOBAL_SCANNERS.items():
-            if name not in ctx.groups:
-                continue
-            task = progress.add_task(f"checking {name}", detail="", total=None)
-            try:
-                items += fn(ctx)
-            except Exception as e:  # one broken tool must not sink the run
-                ctx.warnings.append(f"{name}: scan failed ({e}) — skipped")
-            progress.remove_task(task)
-        items += scan_known_caches(ctx)
-        size_items(items, ctx.size_jobs, progress)
+        probes = [(name, fn) for name, fn in GLOBAL_SCANNERS.items() if name in ctx.groups]
+        probes.append(("known caches", scan_known_caches))
+        with ThreadPoolExecutor(max_workers=PROBE_JOBS) as pool:
+            pending = {pool.submit(probe, name, fn): (index, progress.add_task(
+                f"checking {name}", detail="", total=None)) for index, (name, fn) in enumerate(probes)}
+            if ctx.groups & set(PROJECT_GROUPS):
+                items += scan_projects(ctx, progress)
+            results = {}
+            for future in as_completed(pending):
+                index, task = pending[future]
+                results[index] = future.result()
+                progress.remove_task(task)
+            for index in range(len(probes)):
+                found, warnings = results[index]
+                items += found
+                ctx.warnings.extend(warnings)
+        if ctx.measure_sizes:
+            size_items(items, ctx.size_jobs, progress, cutoff=None if ctx.measure_active else ctx.cutoff)
 
     # Dedupe by path+label (a `build/` can match jvm and dart in the same dir).
     seen: set[str] = set()
@@ -1571,10 +2056,11 @@ def render_table(items: list[Item], threshold: str, aggressive: bool) -> Table:
             table.add_row(str(n), size, age, what)
 
     total = sum(i.size or 0 for i in items if not i.ram)
-    unknown = sum(1 for i in items if i.size is None)
+    unknown = sum(1 for i in items if i.size is None and not i.ram)
     table.add_section()
     table.add_row(
-        "", Text(human_size(total) + ("+" if unknown else ""), style="bold green"), "",
+        "", Text((human_size(total) + "+" if total else "not measured") if unknown else human_size(total),
+                 style="bold green"), "",
         Text(f"{len(items)} item(s) — reclaimable", style="bold green"),
     )
     return table
@@ -1585,19 +2071,22 @@ def render_notes(active: list[Item], extra: list[Item], threshold: str, warnings
     if active:
         total = sum(i.size or 0 for i in active)
         projects = {i.project for i in active}
+        measured = sum(i.size is not None for i in active)
+        size_note = (f"holding[/] [{size_color(total)}]{human_size(total)}[/] " if measured == len(active)
+                     else "[dim](sizes skipped; use --audit to measure them)[/] ")
         out.append(Text.from_markup(
             f"[dim]skipped[/] [bold]{len(active)}[/] [dim]build dir(s) in {len(projects)} active project(s) "
-            f"holding[/] [{size_color(total)}]{human_size(total)}[/] "
+            + size_note +
             f"[dim](edited within {threshold}). include them with[/] [bold]--hours N[/]"
         ))
     if extra:
         total = sum(i.size or 0 for i in extra)
-        top = ", ".join(f"{i.label} {human_size(i.size)}" for i in extra[:4] if i.size)
+        top = ", ".join(i.label + (f" {human_size(i.size)}" if i.size is not None else "") for i in extra[:4])
         more = f", +{len(extra) - 4} more" if len(extra) > 4 else ""
-        out.append(Text.from_markup(
-            f"[dim]another[/] [{size_color(total)}]{human_size(total)}[/] [dim]in {len(extra)} dependency "
-            f"cache(s) / unused image(s) with[/] [bold]--aggressive[/][dim]: {top}{more}[/]"
-        ))
+        space = human_size(total) if all(i.size is not None for i in extra) else "unmeasured space"
+        out.append(Text(f"{space} in {len(extra)} dependency cache(s) / unused image(s) with --aggressive: "
+                        f"{top}{more}", style="dim"))
+
     for w in warnings:
         out.append(Text.from_markup(f"[yellow]![/] [dim]{escape(w)}[/]"))
     return out
@@ -1726,9 +2215,20 @@ def run_audit(ctx: Context, to_clean: list[Item], active: list[Item], extra: lis
 # ---------------------------------------------------------------------------
 
 
-def _delete(item: Item, roots: list[Path]) -> tuple[Item, str | None, str | None]:
-    """→ (item, result note, error)."""
+@dataclass
+class CleanupReport:
+    cleaned: int = 0
+    deferred: int = 0
+    failed: int = 0
+
+
+def _delete(item: Item, roots: list[Path], cancelled: Event | None = None
+            ) -> tuple[Item, str | None, str | CleanupDeferred | None]:
+    """Execute one selected cleanup; busy/partial is distinct from failure or success."""
     try:
+        _cleanup_thread.cancelled = cancelled
+        if cancelled is not None and cancelled.is_set():
+            raise CleanupDeferred("cancelled before cleanup started")
         if item.mode == "action" and item.action:
             return item, item.action(), None
         assert item.path is not None
@@ -1738,46 +2238,105 @@ def _delete(item: Item, roots: list[Path]) -> tuple[Item, str | None, str | None
         else:
             force_rmtree(item.path)
         return item, None, None
-    except Exception as e:
-        return item, None, str(e).strip().splitlines()[-1] if str(e).strip() else repr(e)
+    except CleanupDeferred as error:
+        return item, None, error
+    except Exception as error:
+        return item, None, str(error).strip().splitlines()[-1] if str(error).strip() else repr(error)
 
 
-def clean_all(items: list[Item], workers: int, roots: list[Path]) -> int:
-    failed = 0
-    progress = Progress(
-        SpinnerColumn(style="green"),
-        TextColumn("[bold]cleaning[/] [dim]{task.fields[detail]}[/]"),
-        BarColumn(complete_style="green", finished_style="bold green"),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        console=console,
-    )
-    fs_items = [i for i in items if i.mode != "action"]
-    cmd_items = [i for i in items if i.mode == "action"]
+def clean_all(items: list[Item], workers: int, roots: list[Path]) -> CleanupReport:
+    result = CleanupReport()
+    cancelled = Event()
+    started = time.monotonic()
+    slot_count = min(max(1, workers), len(items))
+    slots = [("waiting", "", None, None) for _ in range(slot_count)]
+    outcomes = {}
 
-    def report(item: Item, note: str | None, err: str | None) -> None:
-        nonlocal failed
-        label = f"{escape(tilde(item.project))} [dim]{escape(item.label)}[/]" if item.is_project else \
-            f"{escape(item.label)}" + (f" [dim]{escape(tilde(item.path))}[/]" if item.path else "")
-        if err is None:
-            console.print(f"  [green]✓[/] {label}" + (f"  [dim]{note}[/]" if note else ""))
+    def render():
+        completed = result.cleaned + result.deferred + result.failed
+        heading = Text(f"Cleaning {completed}/{len(items)}  ·  {result.cleaned} done  ·  "
+                       f"{result.deferred} incomplete  ·  {result.failed} failed  ·  "
+                       f"{_elapsed(time.monotonic() - started)}", style="bold", no_wrap=True, overflow="ellipsis")
+        table = _status_table()
+        styles = {"running": "cyan", "done": "green", "incomplete": "yellow", "failed": "red", "waiting": "dim"}
+        for state, label, began, ended in slots:
+            elapsed = _elapsed((ended if ended is not None else time.monotonic()) - began) if began is not None else "—"
+            table.add_row(Text(state, style=styles[state]), Text(elapsed, style="dim"), Text(label))
+        return Group(heading, table)
+
+    def report(item: Item, note: str | None, error: str | CleanupDeferred | None) -> None:
+        outcomes[id(item)] = (item, note, error)
+        if error is None:
+            result.cleaned += 1
+        elif isinstance(error, CleanupDeferred):
+            result.deferred += 1
         else:
-            failed += 1
-            console.print(f"  [red]✗[/] {label} [dim]— {escape(err)}[/]")
+            result.failed += 1
 
-    with progress:
-        task = progress.add_task("", total=len(items), detail="")
-        # Filesystem deletes in parallel (disk-bound), external commands one at a time.
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = [pool.submit(_delete, i, roots) for i in fs_items]
-            for fut in as_completed(futs):
-                report(*fut.result())
-                progress.advance(task)
-        for it in cmd_items:
-            progress.update(task, detail=it.label)
-            report(*_delete(it, roots))
-            progress.advance(task)
-    return failed
+    # A group with tool actions is one serial lane: Docker prunes must not compete
+    # with each other, nor should a tool race filesystem deletes of its own caches.
+    action_groups = {item.group for item in items if item.mode == "action"}
+    grouped: dict[str, list[Item]] = defaultdict(list)
+    lanes = []
+    for item in items:
+        if item.group in action_groups:
+            grouped[item.group].append(item)
+        else:
+            lanes.append([item])
+    for group_items in grouped.values():
+        lanes.append([i for i in group_items if i.mode != "action"] +
+                     [i for i in group_items if i.mode == "action"])
+
+    with Live(get_renderable=render, console=console, transient=True,
+              auto_refresh=console.is_terminal, refresh_per_second=4, vertical_overflow="crop"):
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            waiting = iter(lanes)
+            pending = {}
+
+            def submit(lane: list[Item], slot: int) -> None:
+                item = lane[0]
+                slots[slot] = ("running", item.label, time.monotonic(), None)
+                pending[pool.submit(_delete, item, roots, cancelled)] = (lane, slot)
+
+            try:
+                for slot in range(min(slot_count, len(lanes))):
+                    submit(next(waiting), slot)
+                while pending:
+                    done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        lane, slot = pending.pop(future)
+                        item, note, error = future.result()
+                        report(item, note, error)
+                        state = "done" if error is None else "incomplete" if isinstance(error, CleanupDeferred) else "failed"
+                        slots[slot] = (state, item.label, slots[slot][2], time.monotonic())
+                        remaining = lane[1:]
+                        if isinstance(error, CleanupDeferred):
+                            for skipped in remaining:
+                                report(skipped, None, CleanupDeferred("skipped after an incomplete cleanup in this group"))
+                            remaining = []
+                        if remaining:
+                            submit(remaining, slot)
+                        else:
+                            following = next(waiting, None)
+                            if following is not None:
+                                submit(following, slot)
+            finally:
+                cancelled.set()
+    # Print once, in selection order. Never append logs above a moving live panel.
+    for item in items:
+        if id(item) not in outcomes:
+            continue
+        _, note, error = outcomes[id(item)]
+        label = Text("  ✓ " if error is None else "  ! " if isinstance(error, CleanupDeferred) else "  ✗ ",
+                     style="green" if error is None else "yellow" if isinstance(error, CleanupDeferred) else "red")
+        label.append(tilde(item.project) + "  " + item.label if item.is_project else item.label)
+        if item.path is not None and not item.is_project:
+            label.append("  " + tilde(item.path), style="dim")
+        detail = str(error) if error is not None else note
+        if detail:
+            label.append(" — " + detail, style="dim")
+        console.print(label)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1911,18 +2470,39 @@ def main() -> int:
                    help="Also clean dependency download caches and all unused docker images")
     p.add_argument("--only", metavar="GROUPS", help="Comma-separated groups to run (e.g. rust,docker)")
     p.add_argument("--skip", metavar="GROUPS", help="Comma-separated groups to skip")
-    p.add_argument("--audit", action="store_true",
+    reports = p.add_mutually_exclusive_group()
+    reports.add_argument("--audit", action="store_true",
                    help="Show the biggest dirs on disk and how much of each would be freed; changes nothing")
-    p.add_argument("--mem", action="store_true",
-                   help="Show which programs hold the memory and how many are orphaned; changes nothing")
+    reports.add_argument("--docker-audit", action="store_true",
+                         help="Show Docker disk usage, container memory and per-builder caches; changes nothing")
+    reports.add_argument("--mem", action="store_true",
+                         help="Show memory by program plus individual PIDs and commands; changes nothing")
+    p.add_argument("--mem-top", type=int, metavar="N", help="Rows per memory table (default 10; requires --mem)")
+    p.add_argument("--mem-filter", metavar="TEXT", help="Match PID, executable or command (requires --mem)")
+    p.add_argument("--mem-tree", action="store_true", help="Group by process family (requires --mem)")
+    p.add_argument("--mem-full", action="store_true", help="Show full paths and commands, wrapping to fit (requires --mem)")
+    p.add_argument("--mem-sort", choices=("memory", "cpu", "growth"), help="Sort memory tables (default memory)")
+    p.add_argument("--mem-watch", type=float, metavar="SECONDS", help="Refresh memory and show growth (requires --mem)")
     p.add_argument("--list", action="store_true", help="List cleaner groups and exit")
     p.add_argument("--size-jobs", type=int, default=None, help="Parallel sizing workers")
-    p.add_argument("--clean-jobs", type=int, default=None, help="Parallel delete workers")
+    p.add_argument("--sizes", action="store_true", help="Measure directory and Docker cache sizes (slower; skipped by default)")
+    p.add_argument("--clean-jobs", type=int, default=None, help="Parallel cleanup workers")
+    p.add_argument("--command-timeout", type=float, metavar="SECONDS",
+                   help="Time limit per cleanup command (default 60); incomplete commands are not retried")
     p.add_argument("--config", type=Path, default=None, help=f"Config path (default: {config_path()})")
     p.add_argument("--init", action="store_true", help="Interactive setup (or --init --yes for static defaults)")
     p.add_argument("--show-config", action="store_true", help="Print resolved config and exit")
     p.add_argument("--completion", choices=["bash", "zsh", "fish"], help="Print a shell completion script and exit")
     args = p.parse_args()
+    if not args.mem and any((args.mem_top is not None, args.mem_filter is not None, args.mem_tree, args.mem_full,
+                             args.mem_sort is not None, args.mem_watch is not None)):
+        p.error("--mem-top, --mem-filter, --mem-tree, --mem-full, --mem-sort and --mem-watch require --mem")
+    if args.mem_top is not None and args.mem_top < 1:
+        p.error("--mem-top must be a positive integer")
+    if args.mem_watch is not None and (not math.isfinite(args.mem_watch) or args.mem_watch <= 0):
+        p.error("--mem-watch must be a finite positive number of seconds")
+    if args.mem_sort == "growth" and args.mem_watch is None:
+        p.error("--mem-sort growth requires --mem-watch")
 
     if args.completion:
         sys.stdout.write(COMPLETIONS[args.completion])
@@ -1933,6 +2513,10 @@ def main() -> int:
         return 0
 
     console.print(banner())
+    if args.docker_audit:
+        ok = run_docker_audit()
+        console.print("\n[dim]docker audit — no changes made.[/]\n")
+        return 0 if ok else 1
 
     cfg_path = args.config or config_path()
 
@@ -1959,6 +2543,10 @@ def main() -> int:
     extra_skip = set(cfg.get("ignore") or [])
     size_jobs = args.size_jobs if args.size_jobs is not None else cfg["size_jobs"]
     clean_jobs = args.clean_jobs if args.clean_jobs is not None else cfg["clean_jobs"]
+    command_timeout = args.command_timeout if args.command_timeout is not None else cfg["command_timeout"]
+    if (not isinstance(command_timeout, (int, float)) or not math.isfinite(command_timeout)
+            or command_timeout <= 0):
+        p.error("--command-timeout / command_timeout must be a finite positive number of seconds")
     aggressive = args.aggressive or bool(cfg.get("aggressive"))
     volumes = docker_cfg.get("volumes")
     docker_volumes: bool | str = "all" if volumes == "all" else bool(volumes)
@@ -1966,7 +2554,7 @@ def main() -> int:
     only = _parse_groups(args.only, "--only")
     skip = _parse_groups(args.skip, "--skip") | set(cfg.get("skip") or [])
     groups = (only or set(ALL_GROUPS)) - skip
-    if not groups:
+    if not groups and not args.mem:
         console.print("[red bold]error:[/] every group is skipped; nothing to do")
         return 2
 
@@ -2003,6 +2591,7 @@ def main() -> int:
         console.print(f"  [bold]procs.orphan_dirs[/] = {[str(d) for d in orphan_dirs]}")
         console.print(f"  [bold]size_jobs[/]   = {size_jobs}")
         console.print(f"  [bold]clean_jobs[/]  = {clean_jobs}\n")
+        console.print(f"  [bold]command_timeout[/] = {command_timeout:g}s")
         return 0
 
     if legacy:
@@ -2013,11 +2602,15 @@ def main() -> int:
         roots=roots, cutoff=now - age_hours * 3600, extra_skip=extra_skip,
         groups=groups, aggressive=aggressive,
         docker_volumes=docker_volumes, size_jobs=size_jobs, sweeps=sweeps, orphan_dirs=orphan_dirs,
+        measure_active=args.audit,
+        command_timeout=command_timeout,
+        measure_sizes=args.sizes or args.audit,
     )
     if args.mem:
-        run_mem(ctx)
+        ok = run_mem(ctx, top=args.mem_top or 10, pattern=args.mem_filter or "", by_tree=args.mem_tree,
+                     sort=args.mem_sort or "memory", watch=args.mem_watch, full=args.mem_full)
         console.print("\n[dim]mem — no changes made.[/]\n")
-        return 0
+        return 0 if ok else 1
     items = scan_all(ctx)
     to_clean, active, extra = partition(items, ctx)
     notes = render_notes(active, extra, threshold, ctx.warnings)
@@ -2039,6 +2632,8 @@ def main() -> int:
 
     console.print()
     console.print(render_table(to_clean, threshold, aggressive))
+    if not ctx.measure_sizes:
+        console.print("[dim]Sizes not measured — add --sizes for byte counts. Actual freed disk is reported after cleanup.[/]")
     for n in notes:
         console.print(n)
 
@@ -2052,17 +2647,19 @@ def main() -> int:
 
     free_before = shutil.disk_usage(HOME).free
     console.print()
-    failed = clean_all(to_clean, clean_jobs, roots)
+    result = clean_all(to_clean, clean_jobs, roots)
     free_after = shutil.disk_usage(HOME).free
     freed = max(0, free_after - free_before)
 
     est = sum(i.size or 0 for i in to_clean if not i.ram)
-    body = (f"[bold green]✓ cleaned {len(to_clean) - failed}[/]/[bold]{len(to_clean)}[/] item(s)"
-            + (f"  ([red]{failed} failed[/])" if failed else "")
-            + f"  •  freed [bold green]{human_size(freed)}[/] [dim](estimated {human_size(est)})[/]")
+    estimate = f" [dim](estimated {human_size(est)})[/]" if ctx.measure_sizes else ""
+    body = (f"[bold green]✓ cleaned {result.cleaned}[/]/[bold]{len(to_clean)}[/] item(s)"
+            + (f"  ([yellow]{result.deferred} incomplete/skipped[/])" if result.deferred else "")
+            + (f"  ([red]{result.failed} failed[/])" if result.failed else "")
+            + f"  •  freed [bold green]{human_size(freed)}[/]" + estimate)
     console.print(Panel(Group(Text.from_markup(body), disk_line()),
-                        border_style="yellow" if failed else "green", box=ROUNDED))
-    return 1 if failed else 0
+                        border_style="yellow" if result.failed or result.deferred else "green", box=ROUNDED))
+    return 1 if result.failed or result.deferred else 0
 
 
 if __name__ == "__main__":
