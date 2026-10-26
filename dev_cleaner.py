@@ -13,6 +13,7 @@ Homebrew, Xcode DerivedData, cargo/npm/uv/pip/gradle caches, ...) and idle temp 
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import math
 import os
@@ -26,9 +27,10 @@ import tempfile
 import time
 import tomllib
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from threading import Event, local
 from typing import Callable
 
 from rich.box import ROUNDED
@@ -236,6 +238,7 @@ DEFAULTS: dict = {
     "skip": [],
     "size_jobs": 16,
     "clean_jobs": 4,
+    "command_timeout": 60,
     "docker": {"volumes": False},
     "extra": [],
     "procs": {"orphan_dirs": []},
@@ -282,8 +285,11 @@ skip = {skip!r}
 # Parallel workers when sizing dirs (I/O bound).
 size_jobs = 16
 
-# Parallel delete workers (disk bound; keep modest).
+# Parallel cleanup workers (disk bound; keep modest).
 clean_jobs = 4
+
+# Maximum seconds per external cleanup command; slow commands are left incomplete.
+command_timeout = 60
 
 [docker]
 # Prune unused volumes too. Off by default: volumes hold data.
@@ -336,7 +342,7 @@ _dev_cleaner() {{
     COMPREPLY=()
     cur="${{COMP_WORDS[COMP_CWORD]}}"
     prev="${{COMP_WORDS[COMP_CWORD-1]}}"
-    opts="--root --days --hours --dry-run --yes --aggressive --only --skip --audit --docker-audit --mem --mem-top --mem-filter --mem-tree --mem-full --mem-sort --mem-watch --list --size-jobs --clean-jobs --config --init --show-config --completion -n -y -a -h --help"
+    opts="--root --days --hours --dry-run --yes --aggressive --only --skip --audit --docker-audit --mem --mem-top --mem-filter --mem-tree --mem-full --mem-sort --mem-watch --list --size-jobs --clean-jobs --command-timeout --config --init --show-config --completion -n -y -a -h --help"
     case "$prev" in
         --root|--config) COMPREPLY=( $(compgen -f -- "$cur") ); return ;;
         --completion) COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ); return ;;
@@ -373,7 +379,8 @@ _dev_cleaner() {{
         '--mem-watch[Refresh memory and show growth]:seconds:' \
         '--list[List cleaner groups and exit]' \
         '--size-jobs[Parallel sizing workers]:N:' \
-        '--clean-jobs[Parallel delete workers]:N:' \
+        '--clean-jobs[Parallel cleanup workers]:N:' \
+        '--command-timeout[Cleanup command time limit]:seconds:' \
         '--config[Config path]:file:_files' \
         '--init[Interactive setup / write a starter config]' \
         '--show-config[Print resolved config and exit]' \
@@ -403,7 +410,8 @@ complete -c dev-cleaner -l mem-sort -d "Sort memory tables" -x -a "memory cpu gr
 complete -c dev-cleaner -l mem-watch -d "Refresh memory and show growth" -x
 complete -c dev-cleaner -l list -d "List cleaner groups and exit"
 complete -c dev-cleaner -l size-jobs -d "Parallel sizing workers" -x
-complete -c dev-cleaner -l clean-jobs -d "Parallel delete workers" -x
+complete -c dev-cleaner -l clean-jobs -d "Parallel cleanup workers" -x
+complete -c dev-cleaner -l command-timeout -d "Cleanup command time limit in seconds" -x
 complete -c dev-cleaner -l config -d "Config path" -r -F
 complete -c dev-cleaner -l init -d "Interactive setup / write a starter config"
 complete -c dev-cleaner -l show-config -d "Print resolved config and exit"
@@ -560,13 +568,31 @@ def force_rmtree(path: Path) -> None:
         shutil.rmtree(path)
 
 
-def clear_dir(path: Path) -> None:
+class CleanupDeferred(RuntimeError):
+    """Partial or unverified cleanup: do not retry a busy backend during this run."""
+
+
+_cleanup_thread = local()
+
+
+def clear_dir(path: Path) -> str | None:
     """Remove a directory's contents but keep the directory itself."""
+    busy = 0
     for child in path.iterdir():
-        if child.is_dir() and not child.is_symlink():
-            force_rmtree(child)
-        else:
-            child.unlink()
+        try:
+            if child.is_dir() and not child.is_symlink():
+                force_rmtree(child)
+            else:
+                child.unlink()
+        except FileNotFoundError:  # another cleaner already removed it
+            continue
+        except OSError as error:
+            if error.errno not in (errno.ENOTEMPTY, errno.EBUSY):
+                raise
+            busy += 1
+    if busy:
+        raise CleanupDeferred(f"partially cleared; {busy} busy cache entries left in place (files changed during cleanup)")
+    return None
 
 
 def assert_deletable(path: Path, roots: list[Path]) -> None:
@@ -619,6 +645,7 @@ class Context:
     orphan_dirs: list[Path] = field(default_factory=list)  # from [procs], on top of the temp dirs
     warnings: list[str] = field(default_factory=list)
     measure_active: bool = False     # deep --audit includes sizes of build dirs excluded by activity
+    command_timeout: float = 60
 
 
 # ---------------------------------------------------------------------------
@@ -768,17 +795,44 @@ def _dir_item(group: str, label: str, path: Path, tier: str, note: str = "",
     return Item(group=group, label=label, path=path, tier=tier, note=note, mode=mode)
 
 
-def _cmd_action(cmd: list[str], timeout: float = 1800, cwd: Path | None = None,
+def _cmd_action(cmd: list[str], timeout: float = 60, cwd: Path | None = None,
                 summary: Callable[[str], str] | None = None) -> Callable[[], str | None]:
     def act() -> str | None:
-        r = run(cmd, timeout=timeout, cwd=cwd)
-        if r is None:
-            raise RuntimeError(f"{cmd[0]} failed to run")
-        if r.returncode != 0:
-            tail = (r.stderr or r.stdout).strip().splitlines()
-            raise RuntimeError(tail[-1] if tail else f"exit {r.returncode}")
-        out = r.stdout.strip()
-        return summary(out) if summary else None
+        # Put plugins/children (notably docker-buildx) in the same client group.
+        # Killing only the docker executable can leave its plugin running.
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                              cwd=cwd, start_new_session=True) as process:
+            deadline = time.monotonic() + timeout
+            try:
+                while True:
+                    cancelled = getattr(_cleanup_thread, "cancelled", None)
+                    if cancelled is not None and cancelled.is_set():
+                        raise CleanupDeferred("cancelled; client stopped, daemon work may still be running")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise CleanupDeferred(
+                            f"timed out after {timeout:g}s; client stopped, cleanup may be partial. "
+                            "A service/daemon request may still be running; later actions in this group are skipped")
+                    try:
+                        stdout, stderr = process.communicate(timeout=min(0.2, remaining))
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+            except (CleanupDeferred, KeyboardInterrupt):
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.communicate()
+                raise
+            if process.returncode != 0:
+                tail = (stderr or stdout).strip().splitlines()
+                if "directory not empty" in (stderr or stdout).lower():
+                    raise CleanupDeferred("cache changed during cleanup; some files remain. "
+                                          "Finish active builds before trying again")
+                raise RuntimeError(tail[-1] if tail else f"exit {process.returncode}")
+            out = stdout.strip()
+            return summary(out) if summary else None
     return act
 
 
@@ -815,12 +869,12 @@ def scan_go(ctx: Context) -> list[Item]:
     it = _dir_item("go", "go build cache", gocache, SAFE, "rebuilt on demand")
     if it:
         if go:
-            it.mode, it.action = "action", _cmd_action([go, "clean", "-cache"])
+            it.mode, it.action = "action", _cmd_action([go, "clean", "-cache"], timeout=ctx.command_timeout)
         items.append(it)
     it = _dir_item("go", "go module cache", gomod, AGGRESSIVE, "re-downloaded")
     if it:
         if go:
-            it.mode, it.action = "action", _cmd_action([go, "clean", "-modcache"])
+            it.mode, it.action = "action", _cmd_action([go, "clean", "-modcache"], timeout=ctx.command_timeout)
         items.append(it)
     return items
 
@@ -835,7 +889,7 @@ def scan_node_global(ctx: Context) -> list[Item]:
             items.append(Item(
                 group="node", label="pnpm store prune", path=store, size=None, tier=SAFE,
                 note="unreferenced packages only", mode="action", shadowed=True,
-                action=_cmd_action([pnpm, "store", "prune"], summary=lambda o: o.splitlines()[-1] if o else None),
+                action=_cmd_action([pnpm, "store", "prune"], timeout=ctx.command_timeout, summary=lambda o: o.splitlines()[-1] if o else None),
             ))
             it = _dir_item("node", "pnpm store", store, AGGRESSIVE, "re-downloaded; live projects keep hardlinks")
             if it:
@@ -858,12 +912,12 @@ def scan_python_global(ctx: Context) -> list[Item]:
             items.append(Item(
                 group="python", label="uv cache prune", path=uv_dir, tier=SAFE,
                 note="unreachable entries only", mode="action", shadowed=True,
-                action=_cmd_action([uv, "cache", "prune"], summary=lambda o: o.splitlines()[-1] if o else None),
+                action=_cmd_action([uv, "cache", "prune"], timeout=ctx.command_timeout, summary=lambda o: o.splitlines()[-1] if o else None),
             ))
         it = _dir_item("python", "uv cache", uv_dir, AGGRESSIVE, "wheels + sources; re-downloaded")
         if it:
             if uv:
-                it.mode, it.action = "action", _cmd_action([uv, "cache", "clean"])
+                it.mode, it.action = "action", _cmd_action([uv, "cache", "clean"], timeout=ctx.command_timeout)
             items.append(it)
     return items
 
@@ -1006,7 +1060,7 @@ def scan_docker(ctx: Context) -> list[Item]:
         # Unknown is not zero: a failed `system df` must not hide the row.
         if size is None or size > 0:
             items.append(Item(group="docker", label=label, size=size, tier=tier, note=note, mode="action",
-                              action=_cmd_action([docker, *args], summary=summarize)))
+                              action=_cmd_action([docker, *args], timeout=ctx.command_timeout, summary=summarize)))
 
     items: list[Item] = []
     containers = reclaimable("Containers")
@@ -1176,7 +1230,7 @@ def scan_brew(ctx: Context) -> list[Item]:
         items.append(Item(
             group="brew", label="brew cleanup --prune=all", size=size or 0, tier=SAFE,
             note="old versions, downloads, logs", mode="action",
-            action=_cmd_action([brew, "cleanup", "-s", "--prune=all"], timeout=900,
+            action=_cmd_action([brew, "cleanup", "-s", "--prune=all"], timeout=ctx.command_timeout,
                                summary=lambda o: f"removed {sum(1 for l in o.splitlines() if l.startswith('Removing'))} item(s)"),
         ))
     r = run([brew, "autoremove", "-n"], timeout=120)
@@ -1186,7 +1240,7 @@ def scan_brew(ctx: Context) -> list[Item]:
             group="brew", label="brew autoremove", size=None, tier=AGGRESSIVE,
             note=f"{len(formulae)} formula(e) no longer needed by anything: "
                  + ", ".join(formulae[:6]) + (" …" if len(formulae) > 6 else ""),
-            mode="action", action=_cmd_action([brew, "autoremove"], timeout=600),
+            mode="action", action=_cmd_action([brew, "autoremove"], timeout=ctx.command_timeout),
         ))
     return items
 
@@ -1212,7 +1266,7 @@ def scan_xcode(ctx: Context) -> list[Item]:
         items.append(Item(
             group="xcode", label="simctl delete unavailable", size=None, tier=SAFE,
             note="simulators whose runtime is gone", mode="action",
-            action=_cmd_action([xcrun, "simctl", "delete", "unavailable"], timeout=300),
+            action=_cmd_action([xcrun, "simctl", "delete", "unavailable"], timeout=ctx.command_timeout),
         ))
     return items
 
@@ -2118,9 +2172,20 @@ def run_audit(ctx: Context, to_clean: list[Item], active: list[Item], extra: lis
 # ---------------------------------------------------------------------------
 
 
-def _delete(item: Item, roots: list[Path]) -> tuple[Item, str | None, str | None]:
-    """→ (item, result note, error)."""
+@dataclass
+class CleanupReport:
+    cleaned: int = 0
+    deferred: int = 0
+    failed: int = 0
+
+
+def _delete(item: Item, roots: list[Path], cancelled: Event | None = None
+            ) -> tuple[Item, str | None, str | CleanupDeferred | None]:
+    """Execute one selected cleanup; busy/partial is distinct from failure or success."""
     try:
+        _cleanup_thread.cancelled = cancelled
+        if cancelled is not None and cancelled.is_set():
+            raise CleanupDeferred("cancelled before cleanup started")
         if item.mode == "action" and item.action:
             return item, item.action(), None
         assert item.path is not None
@@ -2130,12 +2195,15 @@ def _delete(item: Item, roots: list[Path]) -> tuple[Item, str | None, str | None
         else:
             force_rmtree(item.path)
         return item, None, None
-    except Exception as e:
-        return item, None, str(e).strip().splitlines()[-1] if str(e).strip() else repr(e)
+    except CleanupDeferred as error:
+        return item, None, error
+    except Exception as error:
+        return item, None, str(error).strip().splitlines()[-1] if str(error).strip() else repr(error)
 
 
-def clean_all(items: list[Item], workers: int, roots: list[Path]) -> int:
-    failed = 0
+def clean_all(items: list[Item], workers: int, roots: list[Path]) -> CleanupReport:
+    result = CleanupReport()
+    cancelled = Event()
     progress = Progress(
         SpinnerColumn(style="green"),
         TextColumn("[bold]cleaning[/] [dim]{task.fields[detail]}[/]"),
@@ -2144,32 +2212,71 @@ def clean_all(items: list[Item], workers: int, roots: list[Path]) -> int:
         TimeElapsedColumn(),
         console=console,
     )
-    fs_items = [i for i in items if i.mode != "action"]
-    cmd_items = [i for i in items if i.mode == "action"]
 
-    def report(item: Item, note: str | None, err: str | None) -> None:
-        nonlocal failed
+    def report(item: Item, note: str | None, error: str | CleanupDeferred | None) -> None:
         label = f"{escape(tilde(item.project))} [dim]{escape(item.label)}[/]" if item.is_project else \
             f"{escape(item.label)}" + (f" [dim]{escape(tilde(item.path))}[/]" if item.path else "")
-        if err is None:
-            console.print(f"  [green]✓[/] {label}" + (f"  [dim]{note}[/]" if note else ""))
+        if error is None:
+            result.cleaned += 1
+            console.print(f"  [green]✓[/] {label}" + (f"  [dim]{escape(note)}[/]" if note else ""))
+        elif isinstance(error, CleanupDeferred):
+            result.deferred += 1
+            console.print(f"  [yellow]![/] {label} [dim]— {escape(str(error))}[/]")
         else:
-            failed += 1
-            console.print(f"  [red]✗[/] {label} [dim]— {escape(err)}[/]")
+            result.failed += 1
+            console.print(f"  [red]✗[/] {label} [dim]— {escape(error)}[/]")
+
+    # A group with tool actions is one serial lane: Docker prunes must not compete
+    # with each other, nor should a tool race filesystem deletes of its own caches.
+    action_groups = {item.group for item in items if item.mode == "action"}
+    grouped: dict[str, list[Item]] = defaultdict(list)
+    lanes = []
+    for item in items:
+        if item.group in action_groups:
+            grouped[item.group].append(item)
+        else:
+            lanes.append([item])
+    for group_items in grouped.values():
+        lanes.append([i for i in group_items if i.mode != "action"] +
+                     [i for i in group_items if i.mode == "action"])
 
     with progress:
-        task = progress.add_task("", total=len(items), detail="")
-        # Filesystem deletes in parallel (disk-bound), external commands one at a time.
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = [pool.submit(_delete, i, roots) for i in fs_items]
-            for fut in as_completed(futs):
-                report(*fut.result())
-                progress.advance(task)
-        for it in cmd_items:
-            progress.update(task, detail=it.label)
-            report(*_delete(it, roots))
-            progress.advance(task)
-    return failed
+        overall = progress.add_task("", total=len(items), detail="total")
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            waiting = iter(lanes)
+            pending = {}
+
+            def submit(lane: list[Item]) -> None:
+                item = lane[0]
+                task = progress.add_task("", total=1, detail=item.label)
+                pending[pool.submit(_delete, item, roots, cancelled)] = (lane, task)
+
+            try:
+                for _ in range(min(max(1, workers), len(lanes))):
+                    submit(next(waiting))
+                while pending:
+                    done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        lane, task = pending.pop(future)
+                        item, note, error = future.result()
+                        report(item, note, error)
+                        progress.advance(overall)
+                        progress.remove_task(task)
+                        remaining = lane[1:]
+                        if isinstance(error, CleanupDeferred):
+                            for skipped in remaining:
+                                report(skipped, None, CleanupDeferred("skipped after an incomplete cleanup in this group"))
+                                progress.advance(overall)
+                            remaining = []
+                        if remaining:
+                            submit(remaining)
+                        else:
+                            following = next(waiting, None)
+                            if following is not None:
+                                submit(following)
+            finally:
+                cancelled.set()
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2318,7 +2425,9 @@ def main() -> int:
     p.add_argument("--mem-watch", type=float, metavar="SECONDS", help="Refresh memory and show growth (requires --mem)")
     p.add_argument("--list", action="store_true", help="List cleaner groups and exit")
     p.add_argument("--size-jobs", type=int, default=None, help="Parallel sizing workers")
-    p.add_argument("--clean-jobs", type=int, default=None, help="Parallel delete workers")
+    p.add_argument("--clean-jobs", type=int, default=None, help="Parallel cleanup workers")
+    p.add_argument("--command-timeout", type=float, metavar="SECONDS",
+                   help="Time limit per cleanup command (default 60); incomplete commands are not retried")
     p.add_argument("--config", type=Path, default=None, help=f"Config path (default: {config_path()})")
     p.add_argument("--init", action="store_true", help="Interactive setup (or --init --yes for static defaults)")
     p.add_argument("--show-config", action="store_true", help="Print resolved config and exit")
@@ -2373,6 +2482,10 @@ def main() -> int:
     extra_skip = set(cfg.get("ignore") or [])
     size_jobs = args.size_jobs if args.size_jobs is not None else cfg["size_jobs"]
     clean_jobs = args.clean_jobs if args.clean_jobs is not None else cfg["clean_jobs"]
+    command_timeout = args.command_timeout if args.command_timeout is not None else cfg["command_timeout"]
+    if (not isinstance(command_timeout, (int, float)) or not math.isfinite(command_timeout)
+            or command_timeout <= 0):
+        p.error("--command-timeout / command_timeout must be a finite positive number of seconds")
     aggressive = args.aggressive or bool(cfg.get("aggressive"))
     volumes = docker_cfg.get("volumes")
     docker_volumes: bool | str = "all" if volumes == "all" else bool(volumes)
@@ -2417,6 +2530,7 @@ def main() -> int:
         console.print(f"  [bold]procs.orphan_dirs[/] = {[str(d) for d in orphan_dirs]}")
         console.print(f"  [bold]size_jobs[/]   = {size_jobs}")
         console.print(f"  [bold]clean_jobs[/]  = {clean_jobs}\n")
+        console.print(f"  [bold]command_timeout[/] = {command_timeout:g}s")
         return 0
 
     if legacy:
@@ -2428,6 +2542,7 @@ def main() -> int:
         groups=groups, aggressive=aggressive,
         docker_volumes=docker_volumes, size_jobs=size_jobs, sweeps=sweeps, orphan_dirs=orphan_dirs,
         measure_active=args.audit,
+        command_timeout=command_timeout,
     )
     if args.mem:
         ok = run_mem(ctx, top=args.mem_top or 10, pattern=args.mem_filter or "", by_tree=args.mem_tree,
@@ -2468,17 +2583,18 @@ def main() -> int:
 
     free_before = shutil.disk_usage(HOME).free
     console.print()
-    failed = clean_all(to_clean, clean_jobs, roots)
+    result = clean_all(to_clean, clean_jobs, roots)
     free_after = shutil.disk_usage(HOME).free
     freed = max(0, free_after - free_before)
 
     est = sum(i.size or 0 for i in to_clean if not i.ram)
-    body = (f"[bold green]✓ cleaned {len(to_clean) - failed}[/]/[bold]{len(to_clean)}[/] item(s)"
-            + (f"  ([red]{failed} failed[/])" if failed else "")
+    body = (f"[bold green]✓ cleaned {result.cleaned}[/]/[bold]{len(to_clean)}[/] item(s)"
+            + (f"  ([yellow]{result.deferred} incomplete/skipped[/])" if result.deferred else "")
+            + (f"  ([red]{result.failed} failed[/])" if result.failed else "")
             + f"  •  freed [bold green]{human_size(freed)}[/] [dim](estimated {human_size(est)})[/]")
     console.print(Panel(Group(Text.from_markup(body), disk_line()),
-                        border_style="yellow" if failed else "green", box=ROUNDED))
-    return 1 if failed else 0
+                        border_style="yellow" if result.failed or result.deferred else "green", box=ROUNDED))
+    return 1 if result.failed or result.deferred else 0
 
 
 if __name__ == "__main__":
