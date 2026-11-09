@@ -134,21 +134,21 @@ The audit changes nothing. Cache pruning means later rebuilds; removing a builde
 
 ### Faster scans, same commands
 
-Use `dev-cleaner --mem` for memory diagnostics: it does not discover projects or size build directories. Plain `dev-cleaner` performs a disk-cleanup scan. Its default root is `~`, so it discovers projects across every checkout and worktree under directories such as `~/.lazybox`; a large worktree forest can take minutes. For a focused disk scan, pass `--root ~/development` or set narrower `roots` in the config.
+Use `dev-cleaner --mem` for memory diagnostics: it does not discover projects or size build directories. Plain `dev-cleaner` uses a 10-second discovery budget: project search gets the first half, and source-activity checks use the remainder while global cache probes run concurrently. It searches breadth first so nearby checkouts are considered before deep worktree forests. Incomplete activity checks always keep the project. A partial scan is explicitly reported; it is not an exhaustive inventory. Use `--root ~/development` to focus the search, `--thorough` for the full crawl, or `--caches-only` to skip project discovery entirely. `--audit` implies a thorough scan. The budget is checked between filesystem operations; a blocked filesystem call can overrun it. Deletion and opt-in size measurements have separate runtimes.
 
 Normal cleanup skips recursive directory sizing and Docker disk/cache size queries. It shows targets with unmeasured sizes and reports actual freed disk after cleanup. Add `--sizes` for directory byte counts and Docker cache estimates; `--audit` also enables measurements. This avoids walking millions of cache files merely to print a number before deleting them.
 
-Global cleaner checks run up to four at a time while project discovery runs. Docker audits read daemon disk usage, container memory and builder inventories concurrently, and measure up to four builder caches at once. With `--sizes`, the normal Docker scan also measures builder caches concurrently. Results retain their usual order and one failed probe does not hide other groups. Opt-in directory sizing uses `--size-jobs` (default 16); each directory/batch size read has a 30-second limit and unavailable sizes stay unknown. A timed-out `du` is never restarted as a Python walk.
+Global cleaner checks run alongside project discovery, with a shared deadline in normal runs. Completed tools disappear from the status row immediately. Normal runs schedule Homebrew cleanup directly instead of performing the same expensive walk in a dry run first. Docker audits read daemon disk usage, container memory and builder inventories concurrently, and measure up to four builder caches at once. With `--sizes`, the normal Docker scan also measures builder caches concurrently. Results retain their usual order and one failed probe does not hide other groups. Opt-in directory sizing uses `--size-jobs` (default 16); each directory/batch size read has a 30-second limit and unavailable sizes stay unknown. A timed-out `du` is never restarted as a Python walk.
 
 Project discovery shows a directory count and current path throughout the walk, even where no build directories are found. Activity checks stop as soon as a recent source establishes that a project must be kept. Normal cleanup skips sizing active projects' build directories; `--audit` measures them when you want the full disk breakdown. Stale projects still receive the full activity check before qualifying for cleanup.
 
-This overlaps waits for independent tools without adding setup or flags. A single slow daemon request can still take its timeout. In a controlled benchmark of six simulated 100 ms builder reads, the parallel version took 0.21 seconds versus 0.62 seconds sequentially; actual speedups depend on the tools and workload.
+Normal tool probes use only the remaining scan budget. Thorough scans use each tool’s full probe timeout. In a controlled benchmark of six simulated 100 ms builder reads, the parallel version took 0.21 seconds versus 0.62 seconds sequentially; actual speedups depend on the tools and workload.
 
 ### Cleanup that keeps moving
 
-Cleanup runs independent groups concurrently, limited by `--clean-jobs` (default 4). Actions within one tool group remain serial, including Docker prunes and any filesystem cleanup of that tool's caches. Each running action has its own elapsed timer.
+Cleanup starts global caches first, then independent project build directories, limited by `--clean-jobs` (default 4). Tool actions and global cache deletions within one group remain serial, including Docker prunes. Independent project directories can run concurrently even when their language has a package-manager action. Each running action has its own elapsed timer, and the display shows the observed increase in free disk space.
 
-The scan display reserves three fixed rows for projects, tools and sizes. Cleanup reserves fixed worker rows; completed jobs do not remove rows or shift the others. Long paths are clipped to one line in the live display. Completion details print once in selection order after cleanup, rather than scrolling above the running jobs.
+The scan display reserves three fixed rows for projects, tools and sizes. Cleanup reserves fixed worker rows; completed jobs do not remove rows or shift the others. Long paths are clipped to one line in the live display. The preview shows one row per cleaner, and successful cleanup results collapse into counts per cleaner. Failures and incomplete work remain visible. Use `--verbose` for every candidate path and individual cleanup result. Partial temp cleanup is counted as incomplete even when some entries were removed.
 
 External cleanup commands have a 60-second limit. On timeout, dev-cleaner stops the client and its plugins, marks cleanup incomplete, and skips later actions in that group. Other groups continue. A Docker daemon may keep working after its client stops; timeout does not prove that pruning was cancelled or finished. Ctrl-C cancels running command clients too; filesystem deletions already in progress finish before exit.
 
@@ -187,7 +187,7 @@ Two tiers. **Default** removes things that are pure derived output: rebuilding t
 
 **Orphaned processes.** Test binaries and tool plugins can outlive the run that started them and keep holding RAM. A process qualifies for cleanup only when it is yours, has parent PID 1, is older than the configured threshold, has `ps` CPU at most 1%, and its executable lives in a temp dir (`go test` binaries, throwaway builds) or a dir you listed under `[procs] orphan_dirs`. PID 1 alone does not prove a process is abandoned; only list plugin directories whose processes should end with their parent run. Cleanup rechecks the process's executable, owner and start time to avoid signalling a recycled PID. It sends SIGTERM first so a supervisor can tear down its children, then SIGKILL after 8 seconds if it remains. Children are not independently targeted. Its row shows RAM, which is never added to the disk total. Use `--mem` to investigate and `--only procs --dry-run` to preview candidates.
 
-**Temp dirs.** macOS only clears `/tmp` on reboot and `$TMPDIR` after 3 days, and build tools and agents can fill both with gigabytes of throwaway Go caches and checkouts in a day. An entry goes only when it belongs to you, nothing in its top two levels changed within the threshold, and it holds no sockets or pipes (a live program's IPC). `com.apple.*`, `tmux-*`, `ssh-*` and the like are always kept. Each entry is checked again right before it is removed, so one that came back into use since the scan is left alone.
+**Temp dirs.** macOS only clears `/tmp` on reboot and `$TMPDIR` after 3 days, and build tools and agents can fill both with gigabytes of throwaway Go caches and checkouts in a day. Claude session scratchpads and task-output folders are checked entry by entry: touching one scratch directory no longer protects all the old entries in that session. An entry goes only when it belongs to you, nothing in its top two levels changed within the threshold, and that check finds no sockets or pipes (a live program's IPC). `com.apple.*`, `tmux-*`, `ssh-*` and the like are always kept. Each entry is checked again right before it is removed, so one that came back into use since the scan is left alone. Set `[tmp] days` for a separate temp age threshold, or `claude_scratch = false` to keep the older whole-session behavior.
 
 **Docker on macOS.** The images live inside a VM disk image (OrbStack, Docker Desktop, Colima). dev-cleaner reports how much that image holds even when the daemon is down, which is usually because the disk filled up. In that case, free some space, start the daemon and re-run.
 
@@ -235,6 +235,12 @@ size_jobs = 16   # parallel sizing workers
 clean_jobs = 4   # parallel cleanup workers (keep modest)
 command_timeout = 60  # seconds per external cleanup command
 
+[tmp]
+# Optional separate age threshold for /tmp, $TMPDIR and Claude scratch.
+# Omit days to use --days / --hours or the global days setting.
+days = 1
+claude_scratch = true  # check individual entries inside active sessions
+
 [docker]
 # Prune unused volumes too. Off by default: volumes hold data.
 # true = anonymous volumes only, "all" = named ones as well.
@@ -250,9 +256,25 @@ orphan_dirs = ["~/.mytool/plugins"]
 [[extra]]
 path = "~/Library/Caches/mytool"
 days = 3
+include = ["*"]
+exclude = ["keep-*"]
 ```
 
-`roots = ["~"]` is a fine default: the walk skips `~/Library`, package-manager homes and mount points, and finding projects is fast. Narrow roots miss every project that lands next to them later (new clones, worktrees).
+Each `[[extra]]` rule removes only matching **direct children** of `path`; the folder itself stays. `include` defaults to `["*"]`, `exclude` defaults to `[]`, and exclusions win. Patterns match names using `*`, `?` and `[abc]`; paths such as `logs/*.log` are rejected. Use a separate rule with `path = "~/.codefly/logs"` for that folder's contents. An empty `include = []` disables a rule. `days = 0` ignores age while keeping ownership, symlink, mount-point and IPC checks. Explicit per-rule ages and `[tmp] days` take precedence over the global / CLI age.
+
+For example, to clean selected old Codefly log files while keeping a current log and all other Codefly data:
+
+```toml
+[[extra]]
+path = "~/.codefly/logs"
+days = 3
+include = ["*.log", "*.log.*"]
+exclude = ["current.log"]
+```
+
+This rule does not select `.codefly/agents`, `modules`, `data`, `object-storage`, or keys. Preview your rules with `dev-cleaner --only extra --dry-run --sizes`; `--show-config` lists each rule's path, age and patterns. The existing project and cache cleaners retain their own rules.
+
+`roots = ["~"]` searches broadly within the normal time budget. Narrow roots prioritize a particular workspace; `--thorough` searches all configured roots without a budget. The walk skips `~/Library`, package-manager homes and mount points.
 
 Check what `dev-cleaner` resolved (file + flags merged):
 
@@ -282,6 +304,9 @@ dev-cleaner --completion fish > ~/.config/fish/completions/dev-cleaner.fish
 | Flag | Default | Notes |
 |---|---|---|
 | `--root PATH` | `~` | Repeatable. Overrides config. |
+| `--thorough` | off | Remove the normal 10-second discovery budget. Implied by `--audit`. |
+| `--caches-only` | off | Skip project discovery; keep global caches and configured temp cleanup. |
+| `-v`, `--verbose` | off | Show every candidate path and individual cleanup result. |
 | `--days N` | `1.0` | Project idle age in days. |
 | `--hours N` | | Project idle age in hours (mutually exclusive with `--days`). |
 | `-n`, `--dry-run` | off | List candidates, don't clean. |
@@ -310,11 +335,11 @@ dev-cleaner --completion fish > ~/.config/fish/completions/dev-cleaner.fish
 
 ## How it works
 
-1. Walks each root with `os.walk`, skipping irrelevant dirs and never descending into build dirs or venvs (their `site-packages` are full of fake `pyproject.toml`s).
+1. Searches each root breadth first with `os.scandir`, skipping irrelevant dirs and never descending into matched build dirs or venvs. Normal discovery is time-budgeted; `--thorough` removes the limit. Empty build directories are ignored.
 2. For every dir holding a project marker (`Cargo.toml`, `package.json`, `go.mod`, `*.csproj`, …) records its sibling build dirs per the rules table.
 3. Measures each top-level project's last source edit in parallel; nested projects inherit it.
-4. Probes the global caches: asks `go env`, `docker system df`, `docker buildx ls`/`du`, `brew cleanup -n`, `uv cache dir`, `pnpm store path`, checks a list of known cache paths, and lists idle entries in the temp dirs and `[[extra]]` dirs.
-5. Dedupes and shows the grouped table plus notes about `--aggressive` and active projects. Directory sizes are measured with parallel `du -sk` only when `--sizes` or `--audit` is requested; normal cleanup does not wait for size walks.
+4. Probes global caches in parallel: asks `go env`, `docker buildx ls`, `uv cache dir`, `pnpm store path`, checks known cache paths, and lists idle temp and `[[extra]]` entries. Docker disk/cache size queries and Homebrew preview walks are opt-in with `--sizes` or `--audit`.
+5. Dedupes and shows a compact table per cleaner (`--verbose` lists every path) plus notes about `--aggressive` and active projects. Directory sizes are measured with parallel `du -sk` only when `--sizes` or `--audit` is requested; normal cleanup does not wait for size walks.
 6. On confirm: independent cleanup groups and filesystem deletes run concurrently; actions sharing a tool group stay serial. External commands have a configurable 60-second time limit. Busy caches and timed-out commands are reported as incomplete, and later actions in that group are skipped. The summary reports actual freed disk and counts successful, incomplete/skipped, and failed items separately.
 
 One broken tool never sinks the run: a hung Docker daemon or a failing `brew` just produces a warning line.

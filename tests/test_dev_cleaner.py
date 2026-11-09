@@ -201,6 +201,21 @@ def test_clear_dir_keeps_dir(tmp_path: Path):
     assert tmp_path.exists() and d.parent.exists()
 
 
+def test_force_writable_changes_only_directories(tmp_path, monkeypatch):
+    root = mk(tmp_path, "cache", "pkg", files={"dependency": "x"})
+    external = mk(tmp_path, "external", files={"source": "keep"})
+    (root / "link").symlink_to(external, target_is_directory=True)
+    changed = []
+    real_chmod = os.chmod
+    def chmod(path, mode):
+        changed.append(Path(path))
+        return real_chmod(path, mode)
+    monkeypatch.setattr(dc.os, "chmod", chmod)
+    dc._force_writable(tmp_path / "cache")
+    assert set(changed) == {tmp_path / "cache", root}
+    assert (external / "source").read_text() == "keep"
+
+
 def test_assert_deletable_guards(tmp_path: Path):
     with pytest.raises(RuntimeError):
         dc.assert_deletable(Path("/"), [])
@@ -220,7 +235,7 @@ def test_render_config_roundtrip(tmp_path: Path):
     assert cfg == {
         "roots": ["~/dev"], "ignore": ["archive"], "days": 3.0, "aggressive": True,
         "skip": ["docker"], "size_jobs": 16, "clean_jobs": 4, "command_timeout": 60, "docker": {"volumes": True},
-        "procs": {"orphan_dirs": []},
+        "procs": {"orphan_dirs": []}, "tmp": {"claude_scratch": True},
     }
 
 
@@ -296,6 +311,154 @@ def test_sweep_per_entry_cutoff(tmp_path: Path):
                      aggressive=False, docker_volumes=False, size_jobs=2)
     sw = dc.Sweep("extra", "idle entries", tmp_path, (tmp_path,), cutoff=time.time() - 3 * 86400)
     assert dc.scan_sweeps([sw], ctx) == []
+
+
+def test_tmp_cleans_old_scratch_inside_active_session(tmp_path, monkeypatch):
+    monkeypatch.setattr(dc, "temp_roots", lambda: [tmp_path])
+    session = mk(tmp_path, f"claude-{os.getuid()}", "-project", "session")
+    scratch = mk(session, "scratchpad")
+    old = mk(scratch, "old-checkout", files={"source": "old"})
+    _age(old, 5)
+    fresh = mk(scratch, "current-checkout", files={"source": "new"})
+    tasks = mk(session, "tasks", files={"old.log": "done", "current.log": "running"})
+    t = time.time() - 5 * 86400
+    os.utime(tasks / "old.log", (t, t))
+    ctx = _docker_ctx()
+    ctx.cutoff = time.time() - 86400
+    items = dc.scan_tmp(ctx)
+    assert len(items) == 1
+    assert "2 entries" in items[0].note
+    assert items[0].action() == "removed 2"
+    assert not old.exists() and not (tasks / "old.log").exists()
+    assert fresh.exists() and (tasks / "current.log").exists()
+    assert scratch.exists() and tasks.exists() and session.exists()
+
+
+def test_tmp_scratch_granularity_can_be_disabled(tmp_path, monkeypatch):
+    monkeypatch.setattr(dc, "temp_roots", lambda: [tmp_path])
+    session = mk(tmp_path, f"claude-{os.getuid()}", "-project", "session")
+    old = mk(session, "scratchpad", "old", files={"data": "x"})
+    _age(old, 5)
+    ctx = _docker_ctx()
+    ctx.cutoff = time.time() - 86400
+    ctx.tmp_claude_scratch = False
+    assert dc.scan_tmp(ctx) == []
+    _age(session, 5)
+    [item] = dc.scan_tmp(ctx)
+    assert item.action() == "removed 1"
+    assert not session.exists()
+
+
+def test_tmp_uses_separate_age_without_changing_extra(tmp_path, monkeypatch):
+    monkeypatch.setattr(dc, "temp_roots", lambda: [tmp_path])
+    old = mk(tmp_path, "two-days", files={"data": "x"})
+    _age(old, 2)
+    ctx = _docker_ctx()
+    ctx.cutoff = time.time() - 86400
+    ctx.tmp_cutoff = time.time() - 3 * 86400
+    assert dc.scan_tmp(ctx) == []
+    ctx.tmp_cutoff = time.time()
+    [item] = dc.scan_tmp(ctx)
+    assert item.action() == "removed 1" and not old.exists()
+
+
+@pytest.mark.parametrize("level", ["claude", "project", "session", "scratchpad"])
+def test_tmp_does_not_follow_symlinked_containers(tmp_path, monkeypatch, level):
+    base = mk(tmp_path, "tmp")
+    outside = mk(tmp_path, "outside", files={"important": "keep"})
+    _age(outside, 5)
+    monkeypatch.setattr(dc, "temp_roots", lambda: [base])
+    parts = [f"claude-{os.getuid()}", "-project", "session", "scratchpad"]
+    index = ["claude", "project", "session", "scratchpad"].index(level)
+    parent = mk(base, *parts[:index])
+    (parent / parts[index]).symlink_to(outside, target_is_directory=True)
+    _age(base, 5)
+    ctx = _docker_ctx()
+    ctx.cutoff = time.time() - 86400
+    for item in dc.scan_tmp(ctx):
+        item.action()
+    assert (outside / "important").read_text() == "keep"
+
+
+def test_extra_patterns_delete_only_selected_children(tmp_path, monkeypatch):
+    monkeypatch.setattr(dc, "temp_roots", lambda: [])
+    root = mk(tmp_path, ".codefly", "logs", files={
+        "old.log": "old", "old.log.1": "rotated", "current.log": "keep", "metadata.json": "keep"})
+    _age(root, 5)
+    keep = mk(tmp_path, ".codefly", "data", files={"database": "keep"})
+    sweeps = dc.extra_sweeps([{"path": str(root), "days": 3,
+                              "include": ["*.log", "*.log.*"], "exclude": ["current.log"]}], time.time())
+    ctx = _docker_ctx()
+    ctx.sweeps = sweeps
+    [item] = dc.scan_extra(ctx)
+    assert "2 entries" in item.note
+    assert item.action() == "removed 2"
+    assert sorted(p.name for p in root.iterdir()) == ["current.log", "metadata.json"]
+    assert (keep / "database").read_text() == "keep"
+
+
+def test_extra_empty_include_selects_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(dc, "temp_roots", lambda: [])
+    mk(tmp_path, "old", files={"data": "x"})
+    _age(tmp_path, 5)
+    ctx = _docker_ctx()
+    ctx.sweeps = dc.extra_sweeps([{"path": str(tmp_path), "include": []}], time.time())
+    assert dc.scan_extra(ctx) == []
+
+
+def test_broad_sweep_cannot_delete_narrow_rule_exclusions(tmp_path, monkeypatch):
+    monkeypatch.setattr(dc, "temp_roots", lambda: [])
+    narrow = mk(tmp_path, "nested", "logs", files={"old.log": "x", "keep.log": "keep"})
+    _age(tmp_path, 5)
+    ctx = _docker_ctx()
+    ctx.cutoff = time.time() - 86400
+    ctx.sweeps = dc.extra_sweeps([
+        {"path": str(tmp_path)},
+        {"path": str(narrow), "exclude": ["keep.log"]},
+        {"path": str(narrow), "exclude": ["keep.log"]},
+    ], time.time())
+    [item] = dc.scan_extra(ctx)
+    assert item.action() == "removed 1"
+    assert (narrow / "keep.log").exists() and not (narrow / "old.log").exists()
+
+
+@pytest.mark.parametrize("entry", [
+    {"include": "*.log"}, {"exclude": [42]}, {"include": ["logs/*.log"]},
+    {"include": [".."]}, {"days": -1}, {"days": float("nan")}, {"days": True},
+])
+def test_extra_rejects_invalid_rules(tmp_path, entry):
+    with pytest.raises(ValueError):
+        dc.extra_sweeps([{"path": str(tmp_path), **entry}], time.time())
+
+
+def test_sweep_skips_replaced_container(tmp_path):
+    root = mk(tmp_path, "logs", files={"old.log": "x"})
+    outside = mk(tmp_path, "outside", files={"old.log": "keep"})
+    _age(root, 5)
+    _age(outside, 5)
+    action = dc._sweep_action([root / "old.log"], time.time() - 86400)
+    root.rename(tmp_path / "original")
+    root.symlink_to(outside, target_is_directory=True)
+    assert action() == "removed 0, 1 back in use"
+    assert (outside / "old.log").read_text() == "keep"
+
+
+def test_show_config_displays_cleanup_filters(tmp_path, monkeypatch, capsys):
+    config = tmp_path / "config.toml"
+    config.write_text('''[tmp]
+days = 0
+claude_scratch = false
+[[extra]]
+path = "~/.codefly/logs"
+days = 3
+include = ["*.log"]
+exclude = ["current.log"]
+''')
+    monkeypatch.setattr(sys, "argv", ["dev-cleaner", "--config", str(config), "--show-config"])
+    assert dc.main() == 0
+    out = capsys.readouterr().out
+    assert "tmp.days" in out and "tmp.claude_scratch" in out
+    assert "*.log" in out and "current.log" in out and "days=3" in out
 
 
 # --- audit -------------------------------------------------------------------
@@ -1135,7 +1298,7 @@ def test_cleanup_live_rows_are_fixed_and_results_print_afterwards(monkeypatch):
     monkeypatch.setattr(dc, "Live", CaptureLive)
     items = [dc.Item("go", "first " + "x" * 500, mode="action", action=capture),
              dc.Item("go", "second", mode="action", action=capture)]
-    assert dc.clean_all(items, 2, []) == dc.CleanupReport(cleaned=2)
+    assert dc.clean_all(items, 2, [], verbose=True) == dc.CleanupReport(cleaned=2)
     assert frames and {len(frame) for frame in frames} == {3}  # heading plus two reserved slots
     assert all(len(line) <= 60 for frame in frames for line in frame)
     assert output.getvalue().index("first") < output.getvalue().index("second")
@@ -1148,3 +1311,174 @@ def test_unmeasured_total_is_not_presented_as_zero_bytes():
     Console(file=output, width=120).print(dc.render_table([dc.Item("go", "cache", Path("/cache"))], "1d", False))
     assert "not measured" in output.getvalue()
     assert "0.0 B" not in output.getvalue()
+
+
+def test_project_discovery_budget_and_breadth_first(tmp_path, monkeypatch):
+    deep = mk(tmp_path, "forest", "a", "b", "c")
+    near = mk(tmp_path, "near", files={"Cargo.toml": ""})
+    mk(near, "target", files={"artifact": "x"})
+    visited = []
+    list(dc.find_projects(tmp_path, visit=visited.append))
+    assert visited.index(near.resolve()) < visited.index(deep.resolve())
+    monkeypatch.setattr(dc.os, "scandir", lambda *a: pytest.fail("expired scans must not walk"))
+    assert list(dc.find_projects(tmp_path, deadline=0)) == []
+
+
+def test_empty_build_dirs_are_not_candidates(tmp_path):
+    project = mk(tmp_path, "fixture", files={"Cargo.toml": ""})
+    mk(project, "target")
+    assert list(dc.find_projects(tmp_path)) == []
+
+
+def test_expired_activity_cannot_qualify_for_cleanup(tmp_path):
+    project = mk(tmp_path, "stale", files={"Cargo.toml": ""})
+    _age(project, 30)
+    ctx = _docker_ctx()
+    ctx.cutoff = time.time() - 86400
+    activity = dc.project_activity(project, ctx.cutoff, deadline=0)
+    item = dc.Item("rust", "target/", project / "target", project=project, mtime=activity)
+    clean, active, _ = dc.partition([item], ctx)
+    assert clean == [] and active == [item]
+
+
+def test_unreadable_activity_cannot_qualify_for_cleanup(tmp_path, monkeypatch):
+    project = mk(tmp_path, "stale", files={"Cargo.toml": ""})
+    _age(project, 30)
+    def walk(*args, onerror, **kwargs):
+        onerror(PermissionError("denied"))
+        return iter([])
+    monkeypatch.setattr(dc.os, "walk", walk)
+    assert dc.project_activity(project, time.time() - 86400) == float("inf")
+
+
+def test_caches_only_never_discovers_projects(monkeypatch):
+    monkeypatch.setattr(dc, "scan_projects", lambda *a: pytest.fail("cache-only must not discover projects"))
+    monkeypatch.setattr(dc, "GLOBAL_SCANNERS", {"rust": lambda ctx: [dc.Item("rust", "cache")]})
+    monkeypatch.setattr(dc, "scan_known_caches", lambda ctx: [])
+    ctx = _docker_ctx()
+    ctx.groups = {"rust"}
+    ctx.caches_only = True
+    assert [i.label for i in dc.scan_all(ctx)] == ["cache"]
+
+
+def test_scan_command_deadline_does_not_affect_cleanup(monkeypatch):
+    import subprocess
+    timeouts = []
+    def run(cmd, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    monkeypatch.setattr(dc.subprocess, "run", run)
+    dc._scan_thread.deadline = time.monotonic() + 0.5
+    try:
+        dc.run(["probe"], timeout=60)
+        assert 0 < timeouts[-1] <= 0.5
+        dc._scan_thread.deadline = 0
+        assert dc.run(["probe"]) is None
+        assert len(timeouts) == 1
+    finally:
+        dc._scan_thread.deadline = None
+    dc.run(["probe"], timeout=60)
+    assert timeouts[-1] == 60
+
+
+def test_project_deletes_overlap_package_manager_action(tmp_path, monkeypatch):
+    import threading
+    barrier = threading.Barrier(3, timeout=5)
+    def remove(item, roots, cancelled):
+        barrier.wait()
+        return item, None, None
+    monkeypatch.setattr(dc, "_delete", remove)
+    items = [dc.Item("node", "node_modules/", project=tmp_path / str(n)) for n in range(2)]
+    items.append(dc.Item("node", "pnpm prune", mode="action"))
+    assert dc.clean_all(items, 3, []) == dc.CleanupReport(cleaned=3)
+
+
+def test_global_cache_is_scheduled_before_projects(tmp_path, monkeypatch):
+    order = []
+    def remove(item, roots, cancelled):
+        order.append(item.label)
+        return item, None, None
+    monkeypatch.setattr(dc, "_delete", remove)
+    items = [dc.Item("rust", "target/", project=tmp_path), dc.Item("go", "global cache")]
+    dc.clean_all(items, 1, [])
+    assert order == ["global cache", "target/"]
+
+
+def test_compact_preview_and_cleanup_do_not_dump_paths(tmp_path, monkeypatch):
+    from io import StringIO
+    from rich.console import Console
+    output = StringIO()
+    monkeypatch.setattr(dc, "console", Console(file=output, width=80))
+    items = [dc.Item("node", "node_modules/", project=tmp_path / ("very-long-path-" * 20) / str(n))
+             for n in range(200)]
+    dc.console.print(dc.render_summary(items, "1d", False))
+    assert len(output.getvalue().splitlines()) < 10
+    assert "200" in output.getvalue() and "very-long-path" not in output.getvalue()
+    assert "0.0 B" not in output.getvalue()
+    output.seek(0); output.truncate()
+    monkeypatch.setattr(dc, "_delete", lambda item, roots, cancelled: (item, None, None))
+    assert dc.clean_all(items, 4, []).cleaned == 200
+    assert output.getvalue().strip() == "Cleaned: node 200"
+
+
+def test_brew_does_not_repeat_cleanup_walk_without_sizes(monkeypatch):
+    monkeypatch.setattr(dc.shutil, "which", lambda name: "/bin/brew")
+    monkeypatch.setattr(dc, "run", lambda *a, **kw: pytest.fail("no Homebrew dry-run walk"))
+    ctx = _docker_ctx()
+    ctx.measure_sizes = False
+    items = dc.scan_brew(ctx)
+    assert [(i.label, i.tier) for i in items] == [
+        ("brew cleanup --prune=all", dc.SAFE), ("brew autoremove", dc.AGGRESSIVE)]
+
+
+def test_partial_temp_cleanup_is_incomplete(tmp_path, monkeypatch):
+    good = mk(tmp_path, "good", files={"old": "x"})
+    bad = mk(tmp_path, "bad", files={"old": "x"})
+    _age(tmp_path, 30)
+    real = dc.force_rmtree
+    def remove(path):
+        if path == bad:
+            raise PermissionError("denied")
+        real(path)
+    monkeypatch.setattr(dc, "force_rmtree", remove)
+    with pytest.raises(dc.CleanupDeferred, match="removed 1, 1 failed"):
+        dc._sweep_action([good, bad], time.time() - 86400)()
+    assert not good.exists() and bad.exists()
+
+
+@pytest.mark.parametrize("flags,budget,caches_only", [
+    ([], dc.SCAN_SECONDS, False),
+    (["--thorough"], None, False),
+    (["--caches-only"], dc.SCAN_SECONDS, True),
+    (["--audit"], None, False),
+])
+def test_cli_scan_modes(monkeypatch, tmp_path, flags, budget, caches_only):
+    captured = []
+    monkeypatch.setattr(dc, "scan_all", lambda ctx: captured.append(ctx) or [])
+    monkeypatch.setattr(dc, "run_audit", lambda *args: None)
+    monkeypatch.setattr(sys, "argv", ["dev-cleaner", "--dry-run", "--config", str(tmp_path / "config"), *flags])
+    assert dc.main() == 0
+    assert captured[0].scan_seconds == budget
+    assert captured[0].caches_only == caches_only
+
+
+def test_budget_exhaustion_keeps_discovered_candidates_and_reports_partial_scan(tmp_path, monkeypatch):
+    project = mk(tmp_path, "stale", files={"Cargo.toml": ""})
+    target = mk(project, "target", files={"artifact": "x"})
+    _age(project, 30)
+    ticks = [0.0]
+    monkeypatch.setattr(dc.time, "monotonic", lambda: ticks[0])
+    def discover(*args, **kwargs):
+        yield "rust", project, target, dc.BuildDir("target")
+        ticks[0] = 11.0
+    monkeypatch.setattr(dc, "find_projects", discover)
+    ctx = _docker_ctx()
+    ctx.roots = [tmp_path]
+    ctx.groups = {"rust"}
+    ctx.cutoff = time.time() - 86400
+    with dc.make_progress() as progress:
+        items = dc.scan_projects(ctx, progress)
+    assert len(items) == 1
+    assert dc.partition(items, ctx)[0] == []
+    assert any("deeper projects were not scanned" in warning for warning in ctx.warnings)
+    assert any("incomplete activity checks" in warning for warning in ctx.warnings)
