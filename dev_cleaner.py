@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import fnmatch
 import json
 import math
 import os
@@ -26,7 +27,7 @@ import sys
 import tempfile
 import time
 import tomllib
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -57,6 +58,13 @@ MAC_CACHES = HOME / "Library" / "Caches"
 SAFE = "safe"
 AGGRESSIVE = "aggressive"
 PROBE_JOBS = 4                      # cap concurrent tool probes separately from disk sizing
+SCAN_SECONDS = 10                  # normal discovery budget; --thorough opts out
+_scan_thread = local()
+
+
+def scan_expired() -> bool:
+    deadline = getattr(_scan_thread, "deadline", None)
+    return deadline is not None and time.monotonic() >= deadline
 
 # ---------------------------------------------------------------------------
 # Scanning rules
@@ -238,6 +246,7 @@ DEFAULTS: dict = {
     "clean_jobs": 4,
     "command_timeout": 60,
     "docker": {"volumes": False},
+    "tmp": {"claude_scratch": True},
     "extra": [],
     "procs": {"orphan_dirs": []},
 }
@@ -289,6 +298,12 @@ clean_jobs = 4
 # Maximum seconds per external cleanup command; slow commands are left incomplete.
 command_timeout = 60
 
+[tmp]
+# Omit days to inherit the global / CLI idle threshold. Use 0 to ignore age.
+# days = 1
+# Clean old scratchpad entries independently inside active Claude sessions.
+claude_scratch = true
+
 [docker]
 # Prune unused volumes too. Off by default: volumes hold data.
 # true = anonymous volumes only, "all" = named ones as well.
@@ -305,6 +320,8 @@ orphan_dirs = []
 # [[extra]]
 # path = "~/Library/Caches/mytool"
 # days = 3
+# include = ["*"]  # direct child names; shell-style wildcards
+# exclude = ["keep-*"]  # exclusions always win
 """
 
 
@@ -340,7 +357,7 @@ _dev_cleaner() {{
     COMPREPLY=()
     cur="${{COMP_WORDS[COMP_CWORD]}}"
     prev="${{COMP_WORDS[COMP_CWORD-1]}}"
-    opts="--root --days --hours --dry-run --yes --aggressive --only --skip --audit --docker-audit --mem --mem-top --mem-filter --mem-tree --mem-full --mem-sort --mem-watch --list --sizes --size-jobs --clean-jobs --command-timeout --config --init --show-config --completion -n -y -a -h --help"
+    opts="--root --thorough --caches-only --verbose -v --days --hours --dry-run --yes --aggressive --only --skip --audit --docker-audit --mem --mem-top --mem-filter --mem-tree --mem-full --mem-sort --mem-watch --list --sizes --size-jobs --clean-jobs --command-timeout --config --init --show-config --completion -n -y -a -h --help"
     case "$prev" in
         --root|--config) COMPREPLY=( $(compgen -f -- "$cur") ); return ;;
         --completion) COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ); return ;;
@@ -376,6 +393,9 @@ _dev_cleaner() {{
         '--mem-sort[Sort memory tables]:sort:(memory cpu growth)' \
         '--mem-watch[Refresh memory and show growth]:seconds:' \
         '--list[List cleaner groups and exit]' \
+        '--thorough[Search all projects without a scan budget]' \
+        '--caches-only[Skip project discovery]' \
+        '(-v --verbose)'{{-v,--verbose}}'[Show every path and result]' \
         '--sizes[Measure directory and Docker cache sizes (slower)]' \
         '--size-jobs[Parallel sizing workers]:N:' \
         '--clean-jobs[Parallel cleanup workers]:N:' \
@@ -408,6 +428,9 @@ complete -c dev-cleaner -l mem-full -d "Show full paths and commands"
 complete -c dev-cleaner -l mem-sort -d "Sort memory tables" -x -a "memory cpu growth"
 complete -c dev-cleaner -l mem-watch -d "Refresh memory and show growth" -x
 complete -c dev-cleaner -l list -d "List cleaner groups and exit"
+complete -c dev-cleaner -l thorough -d "Search all projects without a scan budget"
+complete -c dev-cleaner -l caches-only -d "Skip project discovery"
+complete -c dev-cleaner -s v -l verbose -d "Show every path and result"
 complete -c dev-cleaner -l sizes -d "Measure directory and Docker cache sizes (slower)"
 complete -c dev-cleaner -l size-jobs -d "Parallel sizing workers" -x
 complete -c dev-cleaner -l clean-jobs -d "Parallel cleanup workers" -x
@@ -478,6 +501,11 @@ def parse_size(s: str, base: int = 1000) -> int | None:
 
 def run(cmd: list[str], timeout: float = 60, **kw) -> subprocess.CompletedProcess | None:
     """Run a command, capturing output. None if missing/timeout/crashed."""
+    deadline = getattr(_scan_thread, "deadline", None)
+    if deadline is not None:
+        timeout = min(timeout, deadline - time.monotonic())
+        if timeout <= 0:
+            return None
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kw)
     except (OSError, subprocess.TimeoutExpired):
@@ -549,8 +577,10 @@ def _force_writable(path: Path) -> None:
         os.chmod(path, os.lstat(path).st_mode | stat.S_IWUSR | stat.S_IXUSR)
     except OSError:
         pass
-    for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
-        for name in dirnames + filenames:
+    # POSIX deletion needs write/search permission on directories, not files.
+    # A scratch tree can hold millions of files: do not chmod every cache file.
+    for dirpath, dirnames, _filenames in os.walk(path, followlinks=False):
+        for name in dirnames:
             p = os.path.join(dirpath, name)
             try:
                 st = os.lstat(p)
@@ -651,6 +681,10 @@ class Context:
     measure_active: bool = False     # deep --audit includes sizes of build dirs excluded by activity
     command_timeout: float = 60
     measure_sizes: bool = False      # recursive size reads are opt-in, never needed to clean
+    tmp_cutoff: float | None = None
+    tmp_claude_scratch: bool = True
+    scan_seconds: float | None = SCAN_SECONDS
+    caches_only: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -659,7 +693,8 @@ class Context:
 
 
 def find_projects(root: Path, extra_skip: set[str] | None = None, *,
-                  visit: Callable[[Path], None] | None = None):
+                  visit: Callable[[Path], None] | None = None,
+                  deadline: float | None = None):
     """Yield (group, project_dir, build_dir, BuildDir) for every build dir under root."""
     root = root.expanduser().resolve()
     skip = SKIP_DIRS | ALWAYS_PRUNE | (extra_skip or set())
@@ -667,8 +702,25 @@ def find_projects(root: Path, extra_skip: set[str] | None = None, *,
         dev = os.stat(root).st_dev
     except OSError:
         return
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        here = Path(dirpath)
+    # Breadth first: nearby checkouts get a turn before a deep worktree forest.
+    pending = deque([root])
+    while pending:
+        if deadline is not None and time.monotonic() >= deadline:
+            return
+        here = pending.popleft()
+        try:
+            with os.scandir(here) as entries:
+                dirs, filenames = {}, set()
+                for entry in entries:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        return
+                    if entry.is_dir(follow_symlinks=False):
+                        dirs[entry.name] = entry.path
+                    else:
+                        filenames.add(entry.name)
+        except OSError:
+            continue
+        dirnames = dirs.keys()
         if visit is not None:
             visit(here)
         matched: set[str] = set()
@@ -681,16 +733,23 @@ def find_projects(root: Path, extra_skip: set[str] | None = None, *,
                     if bd.name not in dirnames or bd.name in matched:
                         continue
                     p = here / bd.name
-                    if p.is_symlink() or not p.is_dir():
+                    if p.is_symlink() or not p.is_dir() or not same_fs(p, dev):
                         continue
                     if bd.require and not (p / bd.require).exists():
                         continue
                     matched.add(bd.name)
+                    try:
+                        with os.scandir(p) as contents:
+                            if next(contents, None) is None:
+                                continue  # empty build fixtures reclaim nothing
+                    except OSError:
+                        continue
                     yield rule.group, here, p, bd
-        dirnames[:] = [d for d in dirnames if d not in skip and d not in matched and same_fs(os.path.join(dirpath, d), dev)]
+        pending.extend(Path(dirs[d]) for d in dirnames
+                       if d not in skip and d not in matched and same_fs(dirs[d], dev))
 
 
-def project_activity(project: Path, cutoff: float | None = None) -> float:
+def project_activity(project: Path, cutoff: float | None = None, *, deadline: float | None = None) -> float:
     """Latest mtime across a project's sources, ignoring build dirs and VCS.
 
     Proxy for "when was this last worked on". Build-dir mtimes are useless:
@@ -698,18 +757,29 @@ def project_activity(project: Path, cutoff: float | None = None) -> float:
     touches node_modules/.cache, etc.
     With a cutoff, stop as soon as one source proves the project is active.
     """
+    if deadline is not None and time.monotonic() >= deadline:
+        return float("inf")
     prune = ALL_BUILD_DIR_NAMES | ALWAYS_PRUNE | {".git", ".hg", ".svn"}
     latest = 0.0
     try:
-        latest = project.stat().st_mtime
+        project_stat = project.stat()
+        latest = project_stat.st_mtime
     except OSError:
-        pass
+        return float("inf")
     if cutoff is not None and latest >= cutoff:
         return latest
-    dev = os.stat(project).st_dev if project.exists() else 0
-    for dirpath, dirnames, filenames in os.walk(project, followlinks=False):
+    dev = project_stat.st_dev
+    unreadable = False
+    def onerror(error: OSError) -> None:
+        nonlocal unreadable
+        unreadable = True
+    for dirpath, dirnames, filenames in os.walk(project, followlinks=False, onerror=onerror):
+        if deadline is not None and time.monotonic() >= deadline:
+            return float("inf")  # incomplete check must NEVER qualify a project for deletion
         dirnames[:] = [d for d in dirnames if d not in prune and same_fs(Path(dirpath) / d, dev)]
         for f in filenames:
+            if deadline is not None and time.monotonic() >= deadline:
+                return float("inf")
             try:
                 m = os.lstat(os.path.join(dirpath, f)).st_mtime
                 if m > latest:
@@ -717,14 +787,19 @@ def project_activity(project: Path, cutoff: float | None = None) -> float:
                 if cutoff is not None and latest >= cutoff:
                     return latest
             except OSError:
-                continue
-    return latest
+                unreadable = True
+    return float("inf") if unreadable else latest
 
 
 def scan_projects(ctx: Context, progress: Progress) -> list[Item]:
+    started = time.monotonic()
+    deadline = started + ctx.scan_seconds if ctx.scan_seconds is not None else None
+    discovery_deadline = started + ctx.scan_seconds / 2 if ctx.scan_seconds is not None else None
     found: list[tuple[str, Path, Path, BuildDir]] = []
     seen: set[Path] = set()
     for root in ctx.roots:
+        if discovery_deadline is not None and time.monotonic() >= discovery_deadline:
+            break
         if not root.exists():
             console.print(f"[dim]skip[/] [yellow]{root}[/] (does not exist)")
             continue
@@ -738,13 +813,17 @@ def scan_projects(ctx: Context, progress: Progress) -> list[Item]:
             if now - last_update >= 0.1:
                 progress.update(task, description=f"scanning {tilde(root)} ({visited:,} dirs)", detail=tilde(here))
                 last_update = now
-        for group, project, build, bd in find_projects(root, ctx.extra_skip, visit=visit):
+        for group, project, build, bd in find_projects(root, ctx.extra_skip, visit=visit, deadline=discovery_deadline):
             if build in seen:
                 continue
             seen.add(build)
             if group in ctx.groups:
                 found.append((group, project, build, bd))
         progress.remove_task(task)
+
+    if discovery_deadline is not None and time.monotonic() >= discovery_deadline:
+        ctx.warnings.append("Project search reached its time budget; deeper projects were not scanned. "
+                            "Use --root PATH to focus it or --thorough for a full scan.")
 
     if not found:
         return []
@@ -753,12 +832,12 @@ def scan_projects(ctx: Context, progress: Progress) -> list[Item]:
     # from its outermost enclosing project: if you're working anywhere in the
     # repo, nothing in it gets swept.
     projects = sorted({p for _, p, _, _ in found}, key=lambda p: len(p.parts))
-    tops: list[Path] = []
+    tops: set[Path] = set()
     top_of: dict[Path, Path] = {}
     for p in projects:
-        parent = next((t for t in tops if p == t or t in p.parents), None)
+        parent = next((t for t in p.parents if t in tops), None)
         if parent is None:
-            tops.append(p)
+            tops.add(p)
             parent = p
         top_of[p] = parent
 
@@ -766,13 +845,16 @@ def scan_projects(ctx: Context, progress: Progress) -> list[Item]:
                              detail="", total=len(tops))
     activity: dict[Path, float] = {}
     with ThreadPoolExecutor(max_workers=ctx.size_jobs) as pool:
-        futs = {pool.submit(project_activity, t, ctx.cutoff): t for t in tops}
+        futs = {pool.submit(project_activity, t, ctx.cutoff, deadline=deadline): t for t in tops}
         for fut in as_completed(futs):
             t = futs[fut]
             activity[t] = fut.result()
             progress.update(task, detail=tilde(t))
             progress.advance(task)
     progress.remove_task(task)
+    unchecked = sum(m == float("inf") for m in activity.values())
+    if unchecked:
+        ctx.warnings.append(f"Kept {unchecked} project(s) with incomplete activity checks (time budget or unreadable files).")
 
     items = []
     for group, project, build, bd in found:
@@ -793,8 +875,9 @@ def _dir_item(group: str, label: str, path: Path, tier: str, note: str = "",
     if not path.is_dir() or path.is_symlink():
         return None
     try:
-        if not any(path.iterdir()):
-            return None
+        with os.scandir(path) as entries:
+            if next(entries, None) is None:
+                return None
     except OSError:
         return None
     return Item(group=group, label=label, path=path, tier=tier, note=note, mode=mode)
@@ -1223,6 +1306,15 @@ def scan_brew(ctx: Context) -> list[Item]:
     brew = shutil.which("brew")
     if not brew:
         return []
+    if not ctx.measure_sizes:
+        # Homebrew's dry-run performs the expensive walk we would repeat at cleanup.
+        items = [Item("brew", "brew cleanup --prune=all", mode="action",
+                      note="old versions, downloads, logs",
+                      action=_cmd_action([brew, "cleanup", "-s", "--prune=all"], timeout=ctx.command_timeout))]
+        items.append(Item("brew", "brew autoremove", tier=AGGRESSIVE, mode="action",
+                          note="formulae no longer needed by anything",
+                          action=_cmd_action([brew, "autoremove"], timeout=ctx.command_timeout)))
+        return items
     items = []
     r = run([brew, "cleanup", "-n", "-s", "--prune=all"], timeout=180)
     if r is None:
@@ -1309,6 +1401,41 @@ class Sweep:
     containers: tuple[Path, ...]     # dirs whose direct children are the candidates
     cutoff: float | None = None      # None = the run's idle threshold
     note: str = ""
+    include: tuple[str, ...] = ("*",)
+    exclude: tuple[str, ...] = ()
+
+    def matches(self, name: str) -> bool:
+        return (any(fnmatch.fnmatchcase(name, p) for p in self.include)
+                and not any(fnmatch.fnmatchcase(name, p) for p in self.exclude))
+
+
+def sweep_days(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise ValueError("cleanup days must be a finite nonnegative number")
+    return float(value)
+
+
+def extra_sweeps(entries: list[dict], now: float) -> list[Sweep]:
+    """Parse explicit cleanup roots; patterns select direct children, never paths."""
+    if not isinstance(entries, list):
+        raise ValueError("extra must be a list of [[extra]] tables")
+    sweeps = []
+    for e in entries:
+        if not isinstance(e, dict) or not isinstance(e.get("path"), str) or not e["path"].strip():
+            raise ValueError("each [[extra]] entry needs a nonempty path string")
+        patterns = {}
+        for key, default in (("include", ["*"]), ("exclude", [])):
+            values = e.get(key, default)
+            if (not isinstance(values, list) or any(
+                    not isinstance(v, str) or not v or v in {".", ".."} or "/" in v or "\\" in v
+                    for v in values)):
+                raise ValueError(f"[[extra]] {key} must be a list of direct child name patterns (no paths)")
+            patterns[key] = tuple(values)
+        d = Path(e["path"]).expanduser().resolve()
+        sweeps.append(Sweep("extra", "idle entries", d, (d,),
+                            cutoff=now - sweep_days(e["days"]) * 86400 if "days" in e else None,
+                            **patterns))
+    return sweeps
 
 
 def idle_since(path: Path, depth: int = 2, budget: int = 2000) -> float | None:
@@ -1318,6 +1445,8 @@ def idle_since(path: Path, depth: int = 2, budget: int = 2000) -> float | None:
     holding one (a live program's IPC). A dir's own mtime only moves when a
     direct child comes or goes, hence the shallow look inside.
     """
+    if scan_expired():
+        return None
     try:
         st = os.lstat(path)
     except OSError:
@@ -1332,6 +1461,8 @@ def idle_since(path: Path, depth: int = 2, budget: int = 2000) -> float | None:
             try:
                 with os.scandir(d) as it:
                     for e in it:
+                        if scan_expired():
+                            return None
                         budget -= 1
                         if budget < 0:
                             return latest
@@ -1348,8 +1479,7 @@ def idle_since(path: Path, depth: int = 2, budget: int = 2000) -> float | None:
     return latest
 
 
-def tmp_sweeps() -> list[Sweep]:
-    out: list[Sweep] = []
+def temp_roots() -> list[Path]:
     seen: set[Path] = set()
     bases = []
     for base in (Path("/tmp"), Path(tempfile.gettempdir())):
@@ -1360,19 +1490,50 @@ def tmp_sweeps() -> list[Sweep]:
         if base.is_dir() and base not in seen:
             seen.add(base)
             bases.append(base)
-            out.append(Sweep("tmp", "idle temp files", base, (base,)))
+    return bases
+
+
+def _owned_child_dirs(parent: Path) -> list[Path]:
+    """Enumerate only real, same-filesystem directories owned by this user."""
+    if scan_expired():
+        return []
+    try:
+        dev = parent.lstat().st_dev
+        with os.scandir(parent) as entries:
+            return [Path(e.path) for e in entries
+                    if (s := e.stat(follow_symlinks=False)).st_uid == os.getuid()
+                    and s.st_dev == dev and stat.S_ISDIR(s.st_mode)]
+    except OSError:
+        return []
+
+
+def tmp_sweeps(ctx: Context | None = None) -> list[Sweep]:
+    cutoff = ctx.tmp_cutoff if ctx else None
+    bases = temp_roots()
+    out = [Sweep("tmp", "idle temp files", base, (base,), cutoff=cutoff) for base in bases]
     # Claude Code: <tmp>/claude-<uid>/<project>/<session>/{scratchpad,tasks}.
     for base in bases:
         claude = base / f"claude-{os.getuid()}"
-        if claude.is_dir():
-            projects = tuple(p for p in claude.iterdir() if p.name.startswith("-") and p.is_dir())
-            out.append(Sweep("tmp", "idle Claude Code scratch", claude, (claude, *projects),
-                             note="session scratchpads and task output"))
+        if claude not in _owned_child_dirs(base):
+            continue
+        projects = [p for p in _owned_child_dirs(claude) if p.name.startswith("-")]
+        containers = [claude, *projects]
+        if ctx is None or ctx.tmp_claude_scratch:
+            sessions = [s for p in projects for s in _owned_child_dirs(p)]
+            payloads = [d for s in sessions for d in _owned_child_dirs(s)
+                        if d.name in {"scratchpad", "tasks"}]
+            containers.extend([*sessions, *payloads])
+        out.append(Sweep("tmp", "idle Claude Code scratch", claude, tuple(containers), cutoff=cutoff,
+                         note="individual scratchpad entries and task output"))
     return out
 
 
 def _sweep_action(entries: list[Path], cutoff: float) -> Callable[[], str | None]:
+    parents = {p: p.parent.resolve() for p in entries}
+
     def remove(p: Path) -> bool | None:
+        if p.parent.resolve() != parents[p]:  # a container was replaced by a symlink
+            return None
         m = idle_since(p)
         if m is None or m >= cutoff:  # back in use (or gone) since the scan
             return None
@@ -1391,6 +1552,8 @@ def _sweep_action(entries: list[Path], cutoff: float) -> Callable[[], str | None
         removed, failed, skipped = results.count(True), results.count(False), results.count(None)
         if failed and not removed:
             raise RuntimeError(f"could not remove any of {failed} entries")
+        if failed:
+            raise CleanupDeferred(f"removed {removed}, {failed} failed, {skipped} back in use")
         return (f"removed {removed}" + (f", {failed} failed" if failed else "")
                 + (f", {skipped} back in use" if skipped else ""))
     return act
@@ -1398,31 +1561,44 @@ def _sweep_action(entries: list[Path], cutoff: float) -> Callable[[], str | None
 
 def scan_sweeps(sweeps: list[Sweep], ctx: Context) -> list[Item]:
     # A dir that is itself swept is never a candidate of its parent.
-    reserved = {c for s in [*tmp_sweeps(), *ctx.sweeps] for c in s.containers}
+    reserved = {c for s in [*tmp_sweeps(ctx), *ctx.sweeps, *sweeps] for c in s.containers}
+    # Reserve ancestors too: a broad rule must not remove a narrower rule's parent.
+    reserved.update(p for c in tuple(reserved) for p in c.parents)
     items = []
+    selected: set[Path] = set()
     for sw in sweeps:
+        if scan_expired():
+            break
         cutoff = sw.cutoff if sw.cutoff is not None else ctx.cutoff
         stale: list[Path] = []
         for c in sw.containers:
             try:
+                if c.is_symlink():
+                    continue
                 names, dev = os.listdir(c), os.stat(c).st_dev
             except OSError:
                 continue
             for name in names:
+                if scan_expired():
+                    break
                 p = c / name
-                if p in reserved or name in TMP_KEEP_NAMES or name.startswith(TMP_KEEP_PREFIXES):
+                if (p in reserved or p in selected or not sw.matches(name)
+                        or name in TMP_KEEP_NAMES or name.startswith(TMP_KEEP_PREFIXES)):
                     continue
                 if not same_fs(p, dev):
                     continue
                 m = idle_since(p)
                 if m is not None and m < cutoff:
                     stale.append(p)
+                    selected.add(p)
         if not stale:
             continue
         sizes = paths_size(stale, ctx.size_jobs) if ctx.measure_sizes else {}
         top = sorted(sizes.items(), key=lambda kv: -kv[1])[:3]
         note = f"{len(stale)} entries" + (
             "; biggest: " + ", ".join(f"{p.name[:28]} {human_size(n)}" for p, n in top) if top else "")
+        if sw.include != ("*",) or sw.exclude:
+            note += f"; include={list(sw.include)!r}, exclude={list(sw.exclude)!r}"
         items.append(Item(
             group=sw.group, label=sw.label, path=sw.path,
             size=sum(sizes.values()) if len(sizes) == len(stale) else None, tier=SAFE,
@@ -1433,7 +1609,7 @@ def scan_sweeps(sweeps: list[Sweep], ctx: Context) -> list[Item]:
 
 
 def scan_tmp(ctx: Context) -> list[Item]:
-    return scan_sweeps(tmp_sweeps(), ctx)
+    return scan_sweeps(tmp_sweeps(ctx), ctx)
 
 
 def scan_extra(ctx: Context) -> list[Item]:
@@ -1912,30 +2088,43 @@ def size_items(items: list[Item], workers: int, progress: Progress, cutoff: floa
 
 def scan_all(ctx: Context) -> list[Item]:
     items: list[Item] = []
+    deadline = time.monotonic() + ctx.scan_seconds if ctx.scan_seconds is not None else None
 
     def probe(name: str, fn: Callable[[Context], list[Item]]) -> tuple[list[Item], list[str]]:
         # Keep warning buffers private; merge results in the familiar group order.
         local_ctx = replace(ctx, warnings=[])
+        _scan_thread.deadline = deadline
         try:
             found = fn(local_ctx)
         except Exception as e:  # one broken tool must not sink the run
             found = []
             local_ctx.warnings.append(f"{name}: scan failed ({e}) — skipped")
+        finally:
+            if scan_expired():
+                local_ctx.warnings.append(f"{name}: scan time budget reached; some candidates may be missing. Use --thorough to finish.")
+            _scan_thread.deadline = None
         return found, local_ctx.warnings
 
     with make_progress() as progress:
         probes = [(name, fn) for name, fn in GLOBAL_SCANNERS.items() if name in ctx.groups]
         probes.append(("known caches", scan_known_caches))
-        with ThreadPoolExecutor(max_workers=PROBE_JOBS) as pool:
+        with ThreadPoolExecutor(max_workers=PROBE_JOBS + 1) as pool:
+            project_future = None
+            if not ctx.caches_only and ctx.groups & set(PROJECT_GROUPS):
+                # Reap tool results while discovery runs, so finished tools disappear immediately.
+                project_future = pool.submit(scan_projects, ctx, progress)
             pending = {pool.submit(probe, name, fn): (index, progress.add_task(
                 f"checking {name}", detail="", total=None)) for index, (name, fn) in enumerate(probes)}
-            if ctx.groups & set(PROJECT_GROUPS):
-                items += scan_projects(ctx, progress)
+            if project_future is not None:
+                pending[project_future] = (None, None)
             results = {}
             for future in as_completed(pending):
                 index, task = pending[future]
-                results[index] = future.result()
-                progress.remove_task(task)
+                if future is project_future:
+                    items += future.result()
+                else:
+                    results[index] = future.result()
+                    progress.remove_task(task)
             for index in range(len(probes)):
                 found, warnings = results[index]
                 items += found
@@ -2006,6 +2195,30 @@ def banner() -> Panel:
                  padding=(0, 2))
 
 
+def render_summary(items: list[Item], threshold: str, aggressive: bool) -> Table:
+    table = Table(title=f"Cleanup · project dirs idle >{threshold}" + (" · aggressive" if aggressive else ""),
+                  box=ROUNDED, expand=True, title_justify="left")
+    table.add_column("Cleaner", no_wrap=True)
+    table.add_column("Targets", justify="right", no_wrap=True)
+    measured = any(i.size is not None for i in items)
+    if measured:
+        table.add_column("Size", justify="right", no_wrap=True)
+    table.add_column("Includes", no_wrap=True, overflow="ellipsis", ratio=1)
+    groups: dict[str, list[Item]] = defaultdict(list)
+    for item in items:
+        groups[item.group].append(item)
+    for group, members in groups.items():
+        labels = list(dict.fromkeys(i.label for i in members))
+        detail = ", ".join(labels[:4]) + (f", +{len(labels) - 4} more" if len(labels) > 4 else "")
+        row = [group, str(len(members))]
+        if measured:
+            known = sum(i.size or 0 for i in members)
+            row.append((human_size(known) + ("+" if any(i.size is None for i in members) else ""))
+                       if any(i.size is not None for i in members) else "—")
+        table.add_row(*row, Text(detail))
+    return table
+
+
 def render_table(items: list[Item], threshold: str, aggressive: bool) -> Table:
     title = "🧹  reclaimable"
     if aggressive:
@@ -2068,6 +2281,7 @@ def render_table(items: list[Item], threshold: str, aggressive: bool) -> Table:
 
 def render_notes(active: list[Item], extra: list[Item], threshold: str, warnings: list[str]) -> list[Text]:
     out = []
+    active = [i for i in active if i.mtime != float("inf")]
     if active:
         total = sum(i.size or 0 for i in active)
         projects = {i.project for i in active}
@@ -2152,7 +2366,7 @@ def covered(d: Path, total: int, items: list[Item]) -> int:
 
 def run_audit(ctx: Context, to_clean: list[Item], active: list[Item], extra: list[Item]) -> None:
     home = HOME.resolve()
-    tmp = [s.path for s in tmp_sweeps()]
+    tmp = [s.path for s in tmp_sweeps(ctx)]
     swept = [d for d in tmp if home not in (d, *d.parents) and not any(o in d.parents for o in tmp)]
     rows: list[tuple[Path, int]] = []
     with make_progress() as progress:
@@ -2244,17 +2458,19 @@ def _delete(item: Item, roots: list[Path], cancelled: Event | None = None
         return item, None, str(error).strip().splitlines()[-1] if str(error).strip() else repr(error)
 
 
-def clean_all(items: list[Item], workers: int, roots: list[Path]) -> CleanupReport:
+def clean_all(items: list[Item], workers: int, roots: list[Path], *, verbose: bool = False) -> CleanupReport:
     result = CleanupReport()
     cancelled = Event()
     started = time.monotonic()
+    free_before = shutil.disk_usage(HOME).free
     slot_count = min(max(1, workers), len(items))
     slots = [("waiting", "", None, None) for _ in range(slot_count)]
     outcomes = {}
 
     def render():
         completed = result.cleaned + result.deferred + result.failed
-        heading = Text(f"Cleaning {completed}/{len(items)}  ·  {result.cleaned} done  ·  "
+        freed = max(0, shutil.disk_usage(HOME).free - free_before)
+        heading = Text(f"Freed {human_size(freed)}  ·  Cleaning {completed}/{len(items)}  ·  {result.cleaned} done  ·  "
                        f"{result.deferred} incomplete  ·  {result.failed} failed  ·  "
                        f"{_elapsed(time.monotonic() - started)}", style="bold", no_wrap=True, overflow="ellipsis")
         table = _status_table()
@@ -2275,17 +2491,19 @@ def clean_all(items: list[Item], workers: int, roots: list[Path]) -> CleanupRepo
 
     # A group with tool actions is one serial lane: Docker prunes must not compete
     # with each other, nor should a tool race filesystem deletes of its own caches.
-    action_groups = {item.group for item in items if item.mode == "action"}
+    action_groups = {item.group for item in items if item.mode == "action" and not item.is_project}
     grouped: dict[str, list[Item]] = defaultdict(list)
     lanes = []
     for item in items:
-        if item.group in action_groups:
+        if item.group in action_groups and not item.is_project:
             grouped[item.group].append(item)
         else:
             lanes.append([item])
     for group_items in grouped.values():
         lanes.append([i for i in group_items if i.mode != "action"] +
                      [i for i in group_items if i.mode == "action"])
+    # Global caches first; independent project builds can use all remaining workers.
+    lanes.sort(key=lambda lane: (lane[0].is_project, -(sum(i.size or 0 for i in lane))))
 
     with Live(get_renderable=render, console=console, transient=True,
               auto_refresh=console.is_terminal, refresh_per_second=4, vertical_overflow="crop"):
@@ -2295,7 +2513,10 @@ def clean_all(items: list[Item], workers: int, roots: list[Path]) -> CleanupRepo
 
             def submit(lane: list[Item], slot: int) -> None:
                 item = lane[0]
-                slots[slot] = ("running", item.label, time.monotonic(), None)
+                label = f"{item.group}: {item.label}"
+                if item.project is not None:
+                    label += f"  {tilde(item.project)}"
+                slots[slot] = ("running", label, time.monotonic(), None)
                 pending[pool.submit(_delete, item, roots, cancelled)] = (lane, slot)
 
             try:
@@ -2322,11 +2543,20 @@ def clean_all(items: list[Item], workers: int, roots: list[Path]) -> CleanupRepo
                                 submit(following, slot)
             finally:
                 cancelled.set()
-    # Print once, in selection order. Never append logs above a moving live panel.
+    # Successful paths are opt-in. Failures remain visible in normal output.
+    if not verbose:
+        counts: dict[str, int] = defaultdict(int)
+        for item, _, error in outcomes.values():
+            if error is None:
+                counts[item.group] += 1
+        if counts:
+            console.print(Text("Cleaned: " + " · ".join(f"{g} {n}" for g, n in counts.items()), style="green"))
     for item in items:
         if id(item) not in outcomes:
             continue
         _, note, error = outcomes[id(item)]
+        if error is None and not verbose:
+            continue
         label = Text("  ✓ " if error is None else "  ! " if isinstance(error, CleanupDeferred) else "  ✗ ",
                      style="green" if error is None else "yellow" if isinstance(error, CleanupDeferred) else "red")
         label.append(tilde(item.project) + "  " + item.label if item.is_project else item.label)
@@ -2461,6 +2691,10 @@ def main() -> int:
     )
     p.add_argument("--root", action="append", default=None,
                    help="Where to search for projects (repeatable). Overrides config.")
+    scope = p.add_mutually_exclusive_group()
+    scope.add_argument("--thorough", action="store_true", help="Search all projects without the normal 10-second scan budget")
+    scope.add_argument("--caches-only", action="store_true", help="Skip project discovery; clean global caches and configured temp entries")
+    p.add_argument("-v", "--verbose", action="store_true", help="Show every candidate path and cleanup result")
     age = p.add_mutually_exclusive_group()
     age.add_argument("--days", type=float, default=None, help="Project idle age in days (default 1)")
     age.add_argument("--hours", type=float, default=None, help="Project idle age in hours")
@@ -2494,6 +2728,8 @@ def main() -> int:
     p.add_argument("--show-config", action="store_true", help="Print resolved config and exit")
     p.add_argument("--completion", choices=["bash", "zsh", "fish"], help="Print a shell completion script and exit")
     args = p.parse_args()
+    if args.audit and args.caches_only:
+        p.error("--audit cannot be combined with --caches-only")
     if not args.mem and any((args.mem_top is not None, args.mem_filter is not None, args.mem_tree, args.mem_full,
                              args.mem_sort is not None, args.mem_watch is not None)):
         p.error("--mem-top, --mem-filter, --mem-tree, --mem-full, --mem-sort and --mem-watch require --mem")
@@ -2566,14 +2802,16 @@ def main() -> int:
         age_hours, threshold = cfg["days"] * 24, f"{cfg['days']:g}d"
 
     now = time.time()
-    sweeps = []
-    for e in cfg.get("extra") or []:
-        if not isinstance(e, dict) or not e.get("path"):
-            console.print(f"[yellow]warning:[/] ignoring \\[\\[extra]] entry without a path: {escape(repr(e))}")
-            continue
-        d = Path(str(e["path"])).expanduser()
-        sweeps.append(Sweep("extra", "idle entries", d, (d,),
-                            cutoff=now - float(e["days"]) * 86400 if "days" in e else None))
+    try:
+        if not isinstance(cfg.get("tmp"), dict):
+            raise ValueError("tmp must be a [tmp] table")
+        tmp_cfg = {**DEFAULTS["tmp"], **cfg["tmp"]}
+        sweeps = extra_sweeps(cfg.get("extra", []), now)
+        tmp_cutoff = now - sweep_days(tmp_cfg["days"]) * 86400 if "days" in tmp_cfg else None
+        if not isinstance(tmp_cfg["claude_scratch"], bool):
+            raise ValueError("tmp.claude_scratch must be true or false")
+    except ValueError as error:
+        p.error(str(error))
 
     procs_cfg = cfg.get("procs") if isinstance(cfg.get("procs"), dict) else {}
     orphan_dirs = [Path(str(d)) for d in procs_cfg.get("orphan_dirs") or []]
@@ -2582,12 +2820,18 @@ def main() -> int:
         src = ("legacy rust-clean config" if legacy else "config file") if cfg_path.exists() else "built-in defaults"
         console.print(f"  [dim]source:[/] {src} [dim]({cfg_path})[/]")
         console.print(f"  [bold]roots[/]       = {[tilde(r) for r in roots]}")
+        console.print(f"  [bold]scan[/]        = {'thorough' if args.thorough or args.audit else 'caches only' if args.caches_only else '10-second budget'}")
         console.print(f"  [bold]ignore[/]      = {sorted(extra_skip)}")
         console.print(f"  [bold]days[/]        = {age_hours / 24:g}")
         console.print(f"  [bold]aggressive[/]  = {aggressive}")
         console.print(f"  [bold]groups[/]      = {[g for g in ALL_GROUPS if g in groups]}")
         console.print(f"  [bold]docker.volumes[/] = {docker_volumes}")
-        console.print(f"  [bold]extra[/]       = {[tilde(s.path) for s in sweeps]}")
+        console.print(f"  [bold]tmp.days[/]    = {tmp_cfg.get('days', age_hours / 24):g}")
+        console.print(f"  [bold]tmp.claude_scratch[/] = {tmp_cfg['claude_scratch']}")
+        for s in sweeps:
+            days = (now - s.cutoff) / 86400 if s.cutoff is not None else age_hours / 24
+            console.print(f"  [bold]extra[/]       = {escape(tilde(s.path))}; days={days:g}; "
+                          f"include={escape(repr(list(s.include)))}; exclude={escape(repr(list(s.exclude)))}")
         console.print(f"  [bold]procs.orphan_dirs[/] = {[str(d) for d in orphan_dirs]}")
         console.print(f"  [bold]size_jobs[/]   = {size_jobs}")
         console.print(f"  [bold]clean_jobs[/]  = {clean_jobs}\n")
@@ -2605,6 +2849,9 @@ def main() -> int:
         measure_active=args.audit,
         command_timeout=command_timeout,
         measure_sizes=args.sizes or args.audit,
+        tmp_cutoff=tmp_cutoff, tmp_claude_scratch=tmp_cfg["claude_scratch"],
+        scan_seconds=None if args.thorough or args.audit else SCAN_SECONDS,
+        caches_only=args.caches_only,
     )
     if args.mem:
         ok = run_mem(ctx, top=args.mem_top or 10, pattern=args.mem_filter or "", by_tree=args.mem_tree,
@@ -2623,15 +2870,16 @@ def main() -> int:
         return 0
 
     if not to_clean:
-        console.print("\n[bold green]✨ nothing to clean — you're tidy![/]" if not (active or extra)
-                      else "\n[bold yellow]nothing to clean at this level.[/]")
+        console.print("\n[bold]No cleanup candidates found in this scan.[/]")
         for n in notes:
             console.print(n)
         console.print()
         return 0
 
     console.print()
-    console.print(render_table(to_clean, threshold, aggressive))
+    console.print((render_table if args.verbose else render_summary)(to_clean, threshold, aggressive))
+    if not args.verbose:
+        console.print(f"[dim]{len(to_clean)} targets · --verbose shows every path · --thorough searches all projects[/]")
     if not ctx.measure_sizes:
         console.print("[dim]Sizes not measured — add --sizes for byte counts. Actual freed disk is reported after cleanup.[/]")
     for n in notes:
@@ -2647,7 +2895,7 @@ def main() -> int:
 
     free_before = shutil.disk_usage(HOME).free
     console.print()
-    result = clean_all(to_clean, clean_jobs, roots)
+    result = clean_all(to_clean, clean_jobs, roots, verbose=args.verbose)
     free_after = shutil.disk_usage(HOME).free
     freed = max(0, free_after - free_before)
 
