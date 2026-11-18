@@ -2924,7 +2924,9 @@ def covered(d: Path, total: int, items: list[Item]) -> int:
             # A cache item takes this whole dir even when its size was not measured. A pruning
             # command of unknown yield (uv cache prune) and a sweep of some of a dir's children
             # (tmp, extra) promise nothing beyond what they measured.
-            if it.size or (it.size is None and not it.shadowed and it.group not in ("tmp", "extra")):
+            if it.size and it.path == d:
+                n += it.size  # a sweep's measured share of its own dir, not the whole of it
+            elif it.size or (it.size is None and not it.shadowed and it.group not in ("tmp", "extra")):
                 return total
             continue
         if it.size and d in it.path.parents:
