@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 import pytest
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import dev_cleaner as dc  # noqa: E402
@@ -99,6 +100,17 @@ def test_find_projects_respects_extra_skip(tmp_path: Path):
     mk(tmp_path, "live", "rs", files={"Cargo.toml": ""}); mk(tmp_path, "live", "rs", "target", files={"x": ""})
     found = {str(b.relative_to(tmp_path)) for _, _, b, _ in dc.find_projects(tmp_path, {"archive"})}
     assert found == {"live/rs/target"}
+
+
+def test_home_level_skips_do_not_hide_nested_projects(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(dc, "HOME", tmp_path)
+    for rel in (("go", "pkg"), (".cache", "tool"),                       # home-level tool dirs: skipped
+                ("repo", ".claude", "worktrees", "wt"), ("repo", ".cache", "env"), ("repo", "sdk", "go")):
+        mk(tmp_path, *rel, files={"package.json": "{}"}); mk(tmp_path, *rel, "node_modules", files={"x": "1"})
+    mk(tmp_path, "repo", ".git", "x", files={"package.json": "{}"}); mk(tmp_path, "repo", ".git", "x", "node_modules", files={"x": "1"})
+    found = {b.relative_to(tmp_path.resolve()).as_posix() for _, _, b, _ in dc.find_projects(tmp_path)}
+    assert found == {"repo/.claude/worktrees/wt/node_modules", "repo/.cache/env/node_modules",
+                     "repo/sdk/go/node_modules"}
 
 
 def test_find_projects_stops_at_mount_points(tmp_path: Path, monkeypatch):
@@ -235,7 +247,7 @@ def test_render_config_roundtrip(tmp_path: Path):
     assert cfg == {
         "roots": ["~/dev"], "ignore": ["archive"], "days": 3.0, "aggressive": True,
         "skip": ["docker"], "size_jobs": 16, "clean_jobs": 4, "command_timeout": 60, "docker": {"volumes": True},
-        "procs": {"orphan_dirs": []}, "tmp": {"claude_scratch": True},
+        "procs": {"orphan_dirs": [], "idle_session_days": 1, "spinning": True}, "tmp": {"claude_scratch": True},
     }
 
 
@@ -295,6 +307,27 @@ def test_scan_sweeps_removes_only_idle(tmp_path: Path):
     assert "1 entries" in item.note and item.size is None
     assert item.action() == "removed 1"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["com.apple.thing", "new"]
+
+
+def test_sweep_keeps_dirs_a_running_process_works_in(tmp_path: Path):
+    import subprocess
+    root = tmp_path.resolve()
+    mk(root, "idle-db", "pgdata", files={"a": "x"}); _age(root / "idle-db", 5)
+    mk(root, "abandoned", files={"a": "x"}); _age(root / "abandoned", 5)
+    ctx = dc.Context(roots=[], cutoff=time.time() - 86400, extra_skip=set(), groups=set(dc.ALL_GROUPS),
+                     aggressive=False, docker_volumes=False, size_jobs=2)
+    server = subprocess.Popen(["sleep", "60"], cwd=root / "idle-db" / "pgdata")
+    try:
+        assert root / "idle-db" in dc.live_cwds()
+        [item] = dc.scan_sweeps([dc.Sweep("extra", "idle entries", root, (root,))], ctx)
+        assert "1 entries" in item.note
+        assert any("running process" in w for w in ctx.warnings)
+        # a process that moves in after the scan is honoured at delete time too
+        act = dc._sweep_action([root / "idle-db", root / "abandoned"], time.time() - 86400)
+        assert act() == "removed 1, 1 back in use"
+    finally:
+        server.kill(); server.wait()
+    assert sorted(p.name for p in root.iterdir()) == ["idle-db"]
 
 
 def test_sweep_skips_entries_back_in_use(tmp_path: Path):
@@ -425,10 +458,39 @@ def test_broad_sweep_cannot_delete_narrow_rule_exclusions(tmp_path, monkeypatch)
 @pytest.mark.parametrize("entry", [
     {"include": "*.log"}, {"exclude": [42]}, {"include": ["logs/*.log"]},
     {"include": [".."]}, {"days": -1}, {"days": float("nan")}, {"days": True},
+    {"keep": -1}, {"keep": 1.5}, {"keep": True}, {"keep": "2"},
 ])
 def test_extra_rejects_invalid_rules(tmp_path, entry):
     with pytest.raises(ValueError):
         dc.extra_sweeps([{"path": str(tmp_path), **entry}], time.time())
+
+
+@pytest.mark.parametrize("days,left", [
+    (0, ["r4", "r5", "stable"]),          # keep the latest two, whatever their age
+    (3.5, ["r3", "r4", "r5", "stable"]),  # outside the newest two AND idle past the age
+])
+def test_extra_keep_spares_the_newest_entries(tmp_path, monkeypatch, days, left):
+    monkeypatch.setattr(dc, "tmp_sweeps", lambda ctx=None: [])
+    for n in range(1, 6):
+        mk(tmp_path, f"r{n}", files={"a": "x"}); _age(tmp_path / f"r{n}", 6 - n)   # r5 is the newest
+    mk(tmp_path, "stable", files={"a": "x"}); _age(tmp_path / "stable", 30)       # excluded: not counted
+    ctx = dc.Context(roots=[], cutoff=time.time() - 86400, extra_skip=set(), groups={"extra"},
+                     aggressive=False, docker_volumes=False, size_jobs=2)
+    ctx.sweeps = dc.extra_sweeps([{"path": str(tmp_path), "days": days, "keep": 2, "exclude": ["stable"]}],
+                                 time.time())
+    [item] = dc.scan_extra(ctx)
+    assert "newest 2 kept" in item.note
+    item.action()
+    assert sorted(p.name for p in tmp_path.iterdir()) == left
+
+
+def test_extra_keep_larger_than_the_dir_removes_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(dc, "tmp_sweeps", lambda ctx=None: [])
+    mk(tmp_path, "only", files={"a": "x"}); _age(tmp_path / "only", 9)
+    ctx = dc.Context(roots=[], cutoff=time.time() - 86400, extra_skip=set(), groups={"extra"},
+                     aggressive=False, docker_volumes=False, size_jobs=2)
+    ctx.sweeps = dc.extra_sweeps([{"path": str(tmp_path), "days": 0, "keep": 3}], time.time())
+    assert dc.scan_extra(ctx) == []
 
 
 def test_sweep_skips_replaced_container(tmp_path):
@@ -458,10 +520,53 @@ exclude = ["current.log"]
     assert dc.main() == 0
     out = capsys.readouterr().out
     assert "tmp.days" in out and "tmp.claude_scratch" in out
-    assert "*.log" in out and "current.log" in out and "days=3" in out
+    assert "*.log" in out and "current.log" in out and "days=3" in out and "keep=" not in out
+    assert "procs.idle_session_days = 1" in out and "procs.spinning = True" in out
+
+
+@pytest.mark.parametrize("value,ok", [("2", True), ("0.5", True), ("false", True), ("0", False), ("-1", False), ("true", False), ('"2"', False)])
+def test_idle_session_days_must_be_a_positive_number(tmp_path, monkeypatch, capsys, value, ok):
+    config = tmp_path / "config.toml"
+    config.write_text(f"[procs]\nidle_session_days = {value}\n")
+    monkeypatch.setattr(sys, "argv", ["dev-cleaner", "--config", str(config), "--show-config"])
+    if ok:
+        assert dc.main() == 0
+        assert f"procs.idle_session_days = {'off' if value == 'false' else value}" in capsys.readouterr().out
+    else:
+        with pytest.raises(SystemExit):
+            dc.main()
 
 
 # --- audit -------------------------------------------------------------------
+
+def test_audit_sizes_match_one_du_and_stop_at_mount_points(tmp_path: Path, monkeypatch):
+    import subprocess
+    root = tmp_path.resolve()
+    mk(root, "dev", "repo", "target", "debug", files={"big": "x" * 300_000})
+    mk(root, "dev", "repo", "src", files={"main.rs": "x" * 5000})
+    mk(root, "dev", files={"notes.txt": "x" * 9000})
+    mk(root, "Library", "Caches", files={"blob": "x" * 70_000})
+    mk(root, "empty")
+    (root / "loose.bin").write_text("x" * 20_000)
+    whole = dc._du_sizes(subprocess.run(["du", "-x", "-k", "-d", "3", str(root)], capture_output=True, text=True).stdout)
+    seen = []
+    sizes, failed = dc.audit_sizes(root, 4, lambda done, total, measured: seen.append((done, total)))
+    assert failed == [] and seen[-1] == (2, 2)
+    assert set(sizes) == set(whole)
+    for d, expected in whole.items():   # dir entries themselves are not counted for the listed levels
+        assert abs(sizes[d] - expected) <= 16 * 1024, d
+    assert sizes[root / "dev" / "repo" / "target"] >= 300_000
+    # a mounted child (the Docker VM's NFS export) is never walked, and a du that fails is reported
+    real_scandir = os.scandir
+
+    class Mounted:
+        def __init__(self, e): self.path = e.path
+        def stat(self, follow_symlinks=True): return SimpleNamespace(st_mode=0o040755, st_dev=-1, st_blocks=0)
+    monkeypatch.setattr(dc.os, "scandir", lambda d: [Mounted(e) if e.name == "Library" else e for e in real_scandir(d)])
+    monkeypatch.setattr(dc, "run", lambda cmd, **kw: None)
+    sizes, failed = dc.audit_sizes(root, 2)
+    assert root / "Library" not in sizes and failed == [root / "dev" / "repo"]
+
 
 def test_audit_rows_descends_where_the_bulk_is():
     g = 1024**2  # du -k reports KB: this many KB is 1 GB
@@ -481,6 +586,11 @@ def test_covered():
     assert dc.covered(Path("/h/c"), 10, items) == 4
     assert dc.covered(Path("/h/c/go-build/x"), 10, items) == 10  # inside a cleaned dir
     assert dc.covered(Path("/h/d"), 10, items) == 0
+    # an unmeasured cache still covers its dir; a pruning command of unknown yield does not
+    unsized = [dc.Item("go", "go module cache", Path("/h/go/pkg/mod")),
+               dc.Item("python", "uv cache prune", Path("/h/uv"), mode="action", shadowed=True)]
+    assert dc.covered(Path("/h/go/pkg/mod"), 10, unsized) == 10
+    assert dc.covered(Path("/h/uv/archive-v0"), 10, unsized) == 0
 
 
 # --- docker ------------------------------------------------------------------
@@ -653,6 +763,201 @@ def test_stop_action_only_signals_what_still_qualifies(monkeypatch):
     assert dc._stop_action([a, b], ("/tmp/",), 86400)() == "stopped 1"
     assert sent == [(11, dc.signal.SIGTERM)]
 
+# --- idle terminal sessions ----------------------------------------------------
+
+def _session_procs():
+    from dataclasses import replace
+    GB = 1024**3
+    return [
+        replace(_proc(10, "/bin/codex", ppid=5, mem=GB), tty="ttys001"),            # silent agent ...
+        replace(_proc(11, "/bin/gopls", ppid=10, mem=GB), tty=""),                  # ... and its detached helper
+        replace(_proc(20, "/bin/claude", ppid=5, mem=GB), tty="ttys002"),           # terminal printed an hour ago
+        replace(_proc(30, "/bin/codex", ppid=5, mem=GB), tty="ttys003"),            # silent, but a child is computing
+        replace(_proc(31, "/bin/make", ppid=30, cpu=80.0), tty="ttys003"),
+        replace(_proc(40, "/bin/codex", ppid=5, mem=GB), tty="ttys004"),            # silent, but something just started
+        replace(_proc(41, "/bin/sh", ppid=40, age=60), tty="ttys004"),
+        replace(_proc(50, "/bin/zsh", ppid=5, mem=5 * 1024**2), tty="ttys005"),     # bare shell: nothing to reclaim
+        replace(_proc(60, "/bin/codex", ppid=5, mem=GB, uid=os.getuid() + 1), tty="ttys006"),  # someone else's
+        replace(_proc(70, "/bin/daemon", ppid=1, mem=GB), tty=""),                  # no terminal at all
+    ]
+
+
+def _fake_ttys(monkeypatch, idle=None):
+    idle = {"ttys002": 3600, **(idle or {})}
+    monkeypatch.setattr(dc, "tty_idle", lambda tty, now: idle.get(tty, 3 * 86400))
+    monkeypatch.setattr(dc, "_own_ttys", lambda procs: set())
+
+
+def test_idle_sessions_need_silence_no_cpu_and_no_new_process(monkeypatch):
+    _fake_ttys(monkeypatch)
+    sessions = dc.terminal_sessions(_session_procs())
+    assert {s.tty for s in sessions} == {"ttys001", "ttys002", "ttys003", "ttys004", "ttys005"}
+    [idle] = dc.idle_sessions(sessions, 2 * 86400)
+    assert idle.tty == "ttys001" and {p.pid for p in idle.procs} == {10, 11} and idle.mem == 2 * 1024**3
+
+
+def test_own_terminal_is_never_a_session_candidate(monkeypatch):
+    from dataclasses import replace
+    monkeypatch.setattr(dc, "tty_idle", lambda tty, now: 9 * 86400)
+    monkeypatch.setattr(dc.os, "getpid", lambda: 12)
+    procs = [replace(_proc(10, "/bin/zsh", ppid=5, mem=1024**3), tty="ttys001"),
+             replace(_proc(11, "/bin/uv", ppid=10), tty="ttys001"),
+             replace(_proc(12, "/bin/python", ppid=11), tty="")]  # us, detached, under that terminal
+    assert dc.terminal_sessions(procs) == []
+
+
+def test_scan_procs_closes_silent_sessions_unless_turned_off(monkeypatch):
+    _fake_ttys(monkeypatch)
+    monkeypatch.setattr(dc, "list_procs", _session_procs)
+    ctx = dc.Context(roots=[], cutoff=time.time() - 86400, extra_skip=set(), groups=set(dc.ALL_GROUPS),
+                     aggressive=False, docker_volumes=False, size_jobs=2)
+    [item] = dc.scan_procs(ctx)   # on by default, at one day
+    assert item.ram and item.size == 2 * 1024**3 and "1 silent ≥1d, 2 processes: codex ×1" in item.note
+    ctx.idle_session_days = None
+    assert dc.scan_procs(ctx) == []
+    ctx.idle_session_days = 5   # nothing has been silent that long
+    assert dc.scan_procs(ctx) == []
+
+
+def test_close_sessions_rechecks_and_hangs_up(monkeypatch):
+    from dataclasses import replace
+    _fake_ttys(monkeypatch, {"ttys007": 3 * 86400, "ttys008": 3 * 86400})
+    a = [replace(_proc(10, "/bin/codex", ppid=5, mem=1024**3), tty="ttys001"), replace(_proc(11, "/bin/gopls", ppid=10), tty="")]
+    b = [replace(_proc(70, "/bin/codex", ppid=5, mem=1024**3), tty="ttys007")]
+    c = [replace(_proc(80, "/bin/codex", ppid=5, mem=1024**3), tty="ttys008")]
+    targets = dc.idle_sessions(dc.terminal_sessions(a + b + c), 86400)
+    assert len(targets) == 3
+    # By clean time: ttys007 printed something; ttys008's PID now belongs to another program.
+    _fake_ttys(monkeypatch, {"ttys007": 5, "ttys008": 3 * 86400})
+    monkeypatch.setattr(dc, "list_procs", lambda: a + b + [replace(c[0], started="later")])
+    sent, dead = [], set()
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            if pid in dead:
+                raise ProcessLookupError
+            return
+        sent.append((pid, sig))
+        dead.add(pid)
+    monkeypatch.setattr(dc.os, "kill", fake_kill)
+    assert dc._close_sessions_action(targets, 86400)() == "closed 1 session(s), 2 processes, 2 back in use"
+    assert sorted(sent) == [(10, dc.signal.SIGHUP), (11, dc.signal.SIGTERM)]
+
+
+def test_memory_view_lists_silent_sessions(monkeypatch):
+    _fake_ttys(monkeypatch)
+    out = _memory_text(monkeypatch, _session_procs(), commands={10: "/bin/codex resume abc"})
+    assert "terminal sessions silent ≥1.0d" in out and "codex resume abc" in out and "ttys001" in out
+    assert "1 silent session(s) hold 2.0 GB across 2 processes" in out and "offers to close them" in out
+    assert "ttys003" not in out
+
+
+def test_spinning_processes_are_ours_detached_and_still_burning(monkeypatch):
+    from dataclasses import replace
+    monkeypatch.setattr(dc, "HOME", Path("/home/me"))
+    hour = 3600
+    spin = dict(age=20 * hour, cpu=25.0)
+    procs = [
+        replace(_proc(1, "/home/me/stack/.venv/bin/python", ppid=9, mem=1024**3, **spin), cpu_time=5 * hour),
+        replace(_proc(2, "/tmp/go-build1/b001/x.test", ppid=9, **spin), cpu_time=5 * hour),
+        replace(_proc(3, "/home/me/bin/build", ppid=9, **spin), cpu_time=5 * hour, tty="ttys001"),   # someone watches it
+        replace(_proc(4, "/Applications/VM.app/Helper", ppid=1, **spin), cpu_time=15 * hour),       # an app
+        replace(_proc(5, "/home/me/bin/server", ppid=9, age=20 * hour, cpu=0.0), cpu_time=5 * hour),  # calmed down
+        replace(_proc(6, "/home/me/bin/new", ppid=9, age=hour, cpu=90.0), cpu_time=0.9 * hour),     # too young
+        replace(_proc(7, "/home/me/bin/light", ppid=9, **spin), cpu_time=0.5 * hour),               # 2.5% average
+        replace(_proc(8, "/home/me/bin/theirs", ppid=9, uid=os.getuid() + 1, **spin), cpu_time=5 * hour),
+    ]
+    assert [p.pid for p in dc.find_spinning(procs)] == [1, 2]
+    monkeypatch.setattr(dc, "list_procs", lambda: procs)
+    ctx = dc.Context(roots=[], cutoff=time.time() - 86400, extra_skip=set(), groups=set(dc.ALL_GROUPS),
+                     aggressive=False, docker_volumes=False, size_jobs=2)
+    [item] = dc.scan_procs(ctx)
+    assert item.label == "spinning processes" and item.cores == pytest.approx(0.5) and "10.0 CPU-hours" in item.note
+    from rich.console import Console
+    c = Console(record=True, width=160)
+    c.print(dc.render_summary([item, dc.Item("go", "cache", Path("/c"), 5 * 1024**3)], "1d", False))
+    text = c.export_text()
+    assert "🔥 cpu" in text and "0.5 cores" in text and "5.0 GB" in text
+    # by clean time one of them went quiet: only the other is stopped
+    monkeypatch.setattr(dc, "list_procs", lambda: [procs[0], replace(procs[1], cpu=0.0)])
+    sent, dead = [], set()
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            if pid in dead:
+                raise ProcessLookupError
+            return
+        sent.append((pid, sig))
+        dead.add(pid)
+    monkeypatch.setattr(dc.os, "kill", fake_kill)
+    assert item.action() == "stopped 1, 1 no longer spinning"
+    assert sent == [(1, dc.signal.SIGTERM)]
+    ctx.stop_spinning = False
+    assert dc.scan_procs(ctx) == []
+
+
+# --- cpu ---------------------------------------------------------------------
+
+@pytest.mark.parametrize("text,seconds", [("0:00.02", 0.02), ("290:00.71", 17400.71), ("01:02:03", 3723),
+                                          ("2-01:02:03", 2 * 86400 + 3723)])
+def test_parse_cputime(text, seconds):
+    assert dc.parse_cputime(text) == pytest.approx(seconds)
+
+
+def test_cpu_rates_use_the_sample_not_the_lifetime_average():
+    from dataclasses import replace
+    spinning = replace(_proc(10, "/bin/spin"), cpu_time=1000.0, started="a")
+    quiet = replace(_proc(20, "/bin/quiet"), cpu_time=50_000.0, started="a")
+    reused = replace(_proc(30, "/bin/old"), cpu_time=900.0, started="a")
+    after = [replace(spinning, cpu_time=1004.0), quiet, replace(reused, cpu_time=1.0, started="b"),
+             replace(_proc(40, "/bin/new", age=1), cpu_time=1.0)]
+    rates = dc.cpu_rates([spinning, quiet, reused], after, 2.0)
+    assert rates == {10: 200.0, 20: 0.0, 40: 50.0}   # a recycled PID is not compared with its predecessor
+    assert dc.cpu_rates([spinning], after, 0) == {}
+
+
+def test_cpu_report_ranks_by_sample_and_flags_sustained_burners(monkeypatch):
+    from dataclasses import replace
+    from io import StringIO
+    from rich.console import Console
+    monkeypatch.setattr(dc.os, "getloadavg", lambda: (60.0, 50.0, 40.0))
+    monkeypatch.setattr(dc.os, "cpu_count", lambda: 10)
+    hour = 3600
+    before = [replace(_proc(10, "/opt/app/server", age=20 * hour), cpu_time=5 * hour),      # 25% for 20 h
+              replace(_proc(20, "/usr/bin/builder", age=60), cpu_time=10.0),                # busy right now
+              replace(_proc(30, "/usr/libexec/mds_stores", age=100 * hour, uid=os.getuid() + 1), cpu_time=20 * hour),
+              replace(_proc(40, "/opt/idle", age=100 * hour), cpu_time=60.0)]
+    after = [replace(before[0], cpu_time=5 * hour + 0.5), replace(before[1], cpu_time=14.0),
+             replace(before[2], cpu_time=20 * hour + 1), before[3]]
+    output = StringIO()
+    Console(file=output, width=200).print(dc.render_cpu(before, after, 2.0, commands={10: "/opt/app/server --port 1"}))
+    out = output.getvalue()
+    assert "load: 60.0 50.0 40.0 (1/5/15 min) on 10 cores" in out and "6.0× the cores" in out
+    assert "sampled 2.0s: 2.8 of 10 cores busy" in out
+    now, sustained = out.split("sustained:")
+    assert now.index("builder") < now.index("mds_stores") < now.index("server --port 1")
+    assert "2 processes" in sustained and "server --port 1" in sustained and "mds_stores" in sustained
+    assert "builder" not in sustained and "/opt/idle" not in sustained
+    assert "Spotlight is indexing" in out and "(uid " in out
+    output = StringIO()
+    Console(file=output, width=200).print(dc.render_cpu(before, after, 2.0, pattern="absent"))
+    assert "No processes match" in output.getvalue()
+
+
+def test_cpu_flag_samples_and_changes_nothing(monkeypatch, capsys):
+    from dataclasses import replace
+    a = replace(_proc(10, "/opt/app/server"), cpu_time=10.0)
+    samples = iter([[a], [replace(a, cpu_time=11.0)]])
+    monkeypatch.setattr(dc, "list_procs", lambda footprints=True: next(samples))
+    monkeypatch.setattr(dc, "process_commands", lambda: {})
+    slept = []
+    monkeypatch.setattr(dc.time, "sleep", slept.append)
+    monkeypatch.setattr(dc, "scan_all", lambda ctx: pytest.fail("--cpu must not scan"))
+    monkeypatch.setattr(sys, "argv", ["dev-cleaner", "--cpu", "--cpu-sample", "0.5", "--top", "3"])
+    assert dc.main() == 0
+    assert slept == [0.5] and "cpu — no changes made" in capsys.readouterr().out
+
+
 # --- resource diagnostics ----------------------------------------------------
 
 def _memory_text(monkeypatch, procs, **options):
@@ -671,8 +976,8 @@ def test_list_procs_preserves_paths_and_start_identity(monkeypatch):
     import subprocess
     monkeypatch.setattr(dc, "IS_MAC", True)
     monkeypatch.setattr(dc, "_footprints", lambda: {41: 2 * 1024**3})
-    out = ("41 1 501 02-01:20:38 2.5 4096 Wed Oct 21 12:30:00 2026 /Applications/My App/server\n"
-           "42 41 501 00:01 0.0 1024 Sun Oct 25 12:30:00 2026 /usr/bin/worker\n"
+    out = ("41 1 501 02-01:20:38 2.5 4096 ttys012 290:00.71 Wed Oct 21 12:30:00 2026 /Applications/My App/server\n"
+           "42 41 501 00:01 0.0 1024 ?? 0:00.02 Sun Oct 25 12:30:00 2026 /usr/bin/worker\n"
            "malformed line\n")
     monkeypatch.setattr(dc, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out, ""))
     a, b = dc.list_procs()
@@ -681,16 +986,18 @@ def test_list_procs_preserves_paths_and_start_identity(monkeypatch):
     assert a.mem == 2 * 1024**3 and a.footprint
     assert a.age == 2 * 86400 + 4838 and a.cpu == 2.5
     assert b.mem == 1024**2 and not b.footprint
+    assert (a.tty, a.cpu_time, b.tty, b.cpu_time) == ("ttys012", 290 * 60 + 0.71, "", 0.02)
 
 
 def test_linux_process_executable_resolution(monkeypatch):
     import subprocess
     monkeypatch.setattr(dc, "IS_MAC", False)
     monkeypatch.setattr(dc.os, "readlink", lambda p: "/opt/my app/server")
-    out = "41 1 501 00:01 0.0 1024 Sun Oct 25 12:30:00 2026 truncated-comm\n"
+    out = "41 1 501 00:01 0.0 1024 pts/3 01-02:03:04 Sun Oct 25 12:30:00 2026 truncated-comm\n"
     monkeypatch.setattr(dc, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out, ""))
     [p] = dc.list_procs()
     assert p.exe == "/opt/my app/server" and not p.footprint
+    assert p.tty == "pts/3" and p.cpu_time == 86400 + 2 * 3600 + 3 * 60 + 4
 
 
 def test_group_procs_separates_executables_and_families():
@@ -791,6 +1098,8 @@ def test_watch_samples_growth_without_cleaning(monkeypatch):
     ["--mem-watch", "5"], ["--mem", "--mem-top", "0"], ["--mem", "--mem-watch", "nan"],
     ["--mem", "--mem-watch", "inf"], ["--mem", "--mem-watch", "-1"],
     ["--mem", "--mem-sort", "growth"], ["--mem", "--docker-audit"],
+    ["--top", "3"], ["--tree"], ["--cpu-sample", "2"], ["--cpu", "--cpu-sample", "0"],
+    ["--cpu", "--mem"], ["--cpu", "--mem-watch", "5"], ["--cpu", "--mem-sort", "cpu"],
 ])
 def test_invalid_diagnostic_options_fail_before_scanning(monkeypatch, args):
     monkeypatch.setattr(sys, "argv", ["dev-cleaner", *args])
