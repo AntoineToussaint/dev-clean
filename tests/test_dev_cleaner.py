@@ -591,6 +591,8 @@ def test_covered():
                dc.Item("python", "uv cache prune", Path("/h/uv"), mode="action", shadowed=True)]
     assert dc.covered(Path("/h/go/pkg/mod"), 10, unsized) == 10
     assert dc.covered(Path("/h/uv/archive-v0"), 10, unsized) == 0
+    # a sweep that removes 3 of its dir's 10 covers 3, not the dir
+    assert dc.covered(Path("/h/logs"), 10, [dc.Item("extra", "idle entries", Path("/h/logs"), 3)]) == 3
 
 
 # --- docker ------------------------------------------------------------------
