@@ -83,7 +83,7 @@ The installer:
 ```bash
 dev-cleaner --dry-run          # show what would be cleaned (no changes)
 dev-cleaner --dry-run --sizes  # also measure byte counts (slower)
-dev-cleaner                    # scan, list, prompt, clean
+dev-cleaner                    # scan disk, memory and CPU; list; prompt; clean
 dev-cleaner --yes              # skip the confirmation prompt
 dev-cleaner --aggressive       # also wipe dependency download caches + all unused docker images
 dev-cleaner --only rust,docker # restrict to some groups
@@ -94,33 +94,57 @@ dev-cleaner --root ~/code      # scan a specific directory for projects
 dev-cleaner --list             # what each group cleans
 dev-cleaner --audit            # biggest dirs on disk, and how much of each would be freed
 dev-cleaner --mem              # memory hogs by program, plus PIDs, parents and commands
-dev-cleaner --mem --mem-tree   # combine an app/agent with its child processes
+dev-cleaner --mem --tree       # combine an app/agent with its child processes
 dev-cleaner --mem --mem-watch 5 --mem-sort growth # watch which processes keep growing
+dev-cleaner --cpu              # what is burning CPU right now, and what has been for hours
 dev-cleaner --docker-audit     # Docker disk, container memory and individual buildx caches
 ```
 
 ### Where did my disk go?
 
-`--audit` measures your home dir (and the temp dirs) with `du`, shows every dir over 1 GB down to where the bulk sits, and puts next to each one what a default run and an `--aggressive` run would free there. Anything marked **not covered** is space dev-cleaner can't see: either a project tree outside your `roots`, or a disposable dir of some tool you can declare under `[[extra]]`. It changes nothing, and on a full disk it takes minutes.
+`--audit` measures your home dir (and the temp dirs) with `du`, shows every dir over 1 GB down to where the bulk sits, and puts next to each one what a default run and an `--aggressive` run would free there. Anything marked **not covered** is space dev-cleaner can't see: either a project tree outside your `roots`, or a disposable dir of some tool you can declare under `[[extra]]`. It changes nothing. The dirs two levels down are each measured by their own `du`, `--size-jobs` at a time, with a running count of dirs done and bytes found; on a full disk it still takes minutes. A dir whose measurement fails is named under the table instead of silently missing from it.
 
 ### Which processes hold my RAM?
 
 `--mem` shows host RAM, compression on macOS, available memory on Linux, swap use, programs ranked by memory, and individual processes with PID, parent PID, CPU, age and command. Programs are grouped by the reported executable, using its full path when available so different installations stay separate. Some processes report only a name; use the command and PID details to distinguish those. Small processes remain visible; there is no 256 MB cutoff.
 
 ```bash
-dev-cleaner --mem --mem-top 20                         # more rows in each table
-dev-cleaner --mem --mem-filter claude                  # match PID, executable or command
-dev-cleaner --mem --mem-filter codefly --mem-tree      # matching families, including their descendants
-dev-cleaner --mem --mem-filter postgres --mem-full     # full executable paths and command arguments
+dev-cleaner --mem --top 20                             # more rows in each table
+dev-cleaner --mem --filter claude                      # match PID, executable or command
+dev-cleaner --mem --filter codefly --tree              # matching families, including their descendants
+dev-cleaner --mem --filter postgres --full             # full executable paths and command arguments
 dev-cleaner --mem --mem-sort cpu                       # find CPU-heavy processes
 dev-cleaner --mem --mem-watch 5 --mem-sort growth       # memory changes between snapshots; Ctrl-C to stop
 ```
 
-Process families follow same-owner parent links, stopping at init, service managers or a missing parent. With `--mem-tree`, a filter selects whole matching families so a small agent's large database child is included. The largest individual processes still appear in a second table. Commands are shortened to fit the terminal unless you pass `--mem-full`.
+Process families follow same-owner parent links, stopping at init, service managers or a missing parent. With `--tree`, a filter selects whole matching families so a small agent's large database child is included. The largest individual processes still appear in a second table. Commands are shortened to fit the terminal unless you pass `--full`. The older `--mem-top`, `--mem-filter`, `--mem-tree` and `--mem-full` spellings still work.
 
 Watch mode compares surviving processes with the same PID, start time, executable, owner and memory metric. New processes are marked `new`; exited processes are excluded from growth. Growth sorting becomes useful after the second snapshot. The refresh interval is a delay between scans; the report shows the actual elapsed time. macOS uses `top`'s physical footprint where available and labels RSS fallbacks; Linux uses RSS, which excludes swapped-out pages. Shared pages can appear in multiple processes, so summed memory is an estimate, not the amount stopping them will release.
 
 CPU is the average reported by `ps`. “Old / low CPU” counts processes older than `--days` / `--hours` with CPU at most 1%; it does not prove they have been idle for that duration. Swap use alone also does not establish current memory pressure. Orphan candidates are reported across the full snapshot, along with memory held by their same-owner descendants, and a command to preview cleanup.
+
+**Silent terminal sessions.** Agents and shells left open in tmux panes or terminal tabs keep their memory, and their language servers', for as long as the terminal exists. `--mem` lists the sessions whose terminal has carried no input or output for a day (or `--days` / `--hours`, or `idle_session_days` when set), in which no process started since and none is using CPU, with the memory each holds including helpers that detached from the terminal. The terminal's own device timestamps are the clock, the one `w` reports as idle time, so a program that prints or is typed at is never silent.
+
+A plain `dev-cleaner` run lists them in its `🧠 memory` row and, once you confirm, hangs each one up the way closing its terminal would: SIGHUP to the programs on the terminal, SIGTERM to their detached helpers, SIGKILL after 8 seconds for whatever ignores both. Every session is re-checked right before: one that printed, ran or started anything since the scan is left alone, as is the terminal dev-cleaner itself runs in and sessions under 64 MB (a bare shell). Preview with `dev-cleaner --only procs --dry-run`. A session holds whatever it has not saved: raise the age with `idle_session_days = 3` under `[procs]`, or set it to `false` to keep every session.
+
+**Spinning processes.** The same run has a `🔥 cpu` row for your own detached programs that have averaged 10% of a core for 6 hours and are still at it: a dev server stuck in a loop, a forgotten test binary. Only executables under your home or a temp dir qualify, never apps, system daemons, package-manager installs, VMs, or anything attached to a terminal. Each is re-checked before it gets SIGTERM (SIGKILL after 8 seconds); one that calmed down is left alone. A long computation you started detached on purpose fits the same description, so read the row before confirming, or set `spinning = false` under `[procs]`.
+
+### What is burning my CPU?
+
+`ps` reports a lifetime or decaying average, which hides a process that just went wild and flatters one that has been spinning for a day. `--cpu` takes two snapshots (2 seconds apart; `--cpu-sample N` for longer) and shows:
+
+- the load average against the core count: a load several times the cores means work is queueing;
+- **CPU by program**, or by whole process family with `--tree`, ranked by what each used during the sample (`100` = one full core), with its total CPU time and memory;
+- the **busiest processes right now**, with their lifetime average next to the sampled rate;
+- **sustained** burners: processes at least an hour old that have averaged 10% of a core or more since they started, ranked by CPU time. A server or agent you expected to be idle that has averaged a quarter of a core for 19 hours is spinning.
+
+```bash
+dev-cleaner --cpu --tree                 # which app, agent session or dev stack as a whole
+dev-cleaner --cpu --filter python --full # only matching processes, full command lines
+dev-cleaner --cpu --cpu-sample 10 --top 20
+```
+
+Processes that start and exit inside the sample (compiler and test-binary swarms) cannot be attributed; `--tree` still shows their surviving parents, and a load far above the busy cores in the header is their signature. When Spotlight's indexer, `fseventsd` or a container VM ranks, the report says what drives it and where to look. The report itself is read-only; a plain `dev-cleaner` run is what offers to stop the spinning ones.
 
 ### What is Docker holding?
 
@@ -128,7 +152,7 @@ CPU is the average reported by `ps`. “Old / low CPU” counts processes older 
 
 Container-builder caches can survive daemon-level cache pruning. Builder estimates are shown separately from daemon and VM disk totals because these views can overlap. Some cache queries can take a while; unavailable measurements display `?`.
 
-The RAM visible to the daemon is capacity, not the VM's host memory consumption. Compare container memory with OrbStack/Docker/Colima processes in `--mem`; the difference also includes guest caches, services and differences in accounting. A large difference alone does not explain slow container starts.
+The RAM visible to the daemon is capacity, not the VM's host memory consumption. Compare container memory and CPU with OrbStack/Docker/Colima processes in `--mem` and `--cpu`; the difference also includes guest caches, services and differences in accounting. A large difference alone does not explain slow container starts.
 
 The audit changes nothing. Cache pruning means later rebuilds; removing a builder also removes its configuration. Restarting the runtime interrupts its workloads, and deleting volumes can remove persistent data. Preview the existing cleanup actions with `dev-cleaner --only docker --dry-run`. Space freed inside a VM may take time to return to the host filesystem.
 
@@ -180,10 +204,10 @@ Two tiers. **Default** removes things that are pure derived output: rebuilding t
 | 🐳 docker | `docker system prune` (stopped containers, dangling images, unused networks); `docker builder prune -a`; `docker buildx prune` for every local `docker-container` builder (their cache lives in the builder's own container, so `system prune` never sees it); unused volumes if enabled in config | `docker image prune -a` |
 | 🍺 brew | `brew cleanup -s --prune=all` | `brew autoremove` |
 | 🍎 xcode | DerivedData, Xcode cache, CoreSimulator caches, `simctl delete unavailable` | `iOS/watchOS/tvOS/visionOS DeviceSupport` |
-| 🧰 tools | ccache, kubectl discovery cache | playwright / puppeteer / cypress browsers, electron, node-gyp, deno, trivy, helm, bazel, JetBrains caches |
+| 🧰 tools | ccache, kubectl discovery cache | playwright / puppeteer / cypress browsers, electron, node-gyp, deno, trivy, grype, helm, bazel, JetBrains caches |
 | 🗑️ tmp | entries of `/tmp` and `$TMPDIR` idle past the threshold; idle Claude Code session scratch (`/tmp/claude-<uid>/…`) | |
 | 📁 extra | idle children of the dirs you list under `[[extra]]` | |
-| 🧟 procs | stops idle orphaned processes (parent gone) that run from a temp dir or a `[procs] orphan_dirs` dir | |
+| 🧟 procs | stops idle orphaned processes (parent gone) that run from a temp dir or a `[procs] orphan_dirs` dir; closes terminal sessions silent for a day; stops your detached programs that have burned CPU for 6+ hours | |
 
 **Orphaned processes.** Test binaries and tool plugins can outlive the run that started them and keep holding RAM. A process qualifies for cleanup only when it is yours, has parent PID 1, is older than the configured threshold, has `ps` CPU at most 1%, and its executable lives in a temp dir (`go test` binaries, throwaway builds) or a dir you listed under `[procs] orphan_dirs`. PID 1 alone does not prove a process is abandoned; only list plugin directories whose processes should end with their parent run. Cleanup rechecks the process's executable, owner and start time to avoid signalling a recycled PID. It sends SIGTERM first so a supervisor can tear down its children, then SIGKILL after 8 seconds if it remains. Children are not independently targeted. Its row shows RAM, which is never added to the disk total. Use `--mem` to investigate and `--only procs --dry-run` to preview candidates.
 
@@ -250,6 +274,10 @@ volumes = false
 # Orphaned processes are stopped when their executable lives in a temp dir.
 # Add dirs whose executables only ever run under a parent (a plugin dir).
 orphan_dirs = ["~/.mytool/plugins"]
+# Close terminal sessions (tmux panes, tabs) silent for this many days; false keeps them.
+idle_session_days = 1
+# Stop your detached programs that have burned CPU for 6+ hours and still do.
+spinning = true
 
 # Disposable dirs of your own tools: children idle longer than `days` are
 # removed (`days` defaults to the global one). Repeat the block per dir.
@@ -258,9 +286,20 @@ path = "~/Library/Caches/mytool"
 days = 3
 include = ["*"]
 exclude = ["keep-*"]
+
+# Versioned output (releases, snapshots, per-version caches): keep the newest
+# few, remove every older one whatever its age.
+[[extra]]
+path = "~/Library/Caches/mytool/releases"
+days = 0
+keep = 3
 ```
 
 Each `[[extra]]` rule removes only matching **direct children** of `path`; the folder itself stays. `include` defaults to `["*"]`, `exclude` defaults to `[]`, and exclusions win. Patterns match names using `*`, `?` and `[abc]`; paths such as `logs/*.log` are rejected. Use a separate rule with `path = "~/.codefly/logs"` for that folder's contents. An empty `include = []` disables a rule. `days = 0` ignores age while keeping ownership, symlink, mount-point and IPC checks. Explicit per-rule ages and `[tmp] days` take precedence over the global / CLI age.
+
+`keep = N` always spares the N most recently modified matching children, so a rule can mean "the latest versions stay": with `days = 0` everything older than the newest N goes; with an age, an entry must be both outside the newest N and idle past it.
+
+An entry is also kept, whatever its age, while one of your running processes has its working directory inside it. An idle database or dev server writes nothing for days, so mtimes alone would hand its data dir to the sweep; this applies to temp dirs as well.
 
 For example, to clean selected old Codefly log files while keeping a current log and all other Codefly data:
 
@@ -316,11 +355,13 @@ dev-cleaner --completion fish > ~/.config/fish/completions/dev-cleaner.fish
 | `--skip GROUPS` | | Comma-separated groups to skip (merged with config). |
 | `--audit` | | Show the biggest dirs and how much of each would be freed; change nothing. |
 | `--docker-audit` | | Read-only Docker disk, container memory and per-builder cache inventory. |
-| `--mem` | | Read-only host memory, programs, individual PIDs and orphan candidates. |
-| `--mem-top N` | `10` | Rows per memory table; requires `--mem`. |
-| `--mem-filter TEXT` | | Case-insensitive match on PID, executable or command. With `--mem-tree`, selects whole matching families. |
-| `--mem-tree` | off | Group memory by process family; requires `--mem`. |
-| `--mem-full` | off | Wrap full paths and commands instead of shortening them; requires `--mem`. |
+| `--mem` | | Read-only host memory, programs, individual PIDs, silent terminal sessions and orphan candidates. |
+| `--cpu` | | Read-only sampled CPU by program, busiest processes and sustained burners. |
+| `--cpu-sample SECONDS` | `2` | Sampling window; requires `--cpu`. |
+| `--top N` | `10` | Rows per table; with `--mem` or `--cpu`. |
+| `--filter TEXT` | | Case-insensitive match on PID, executable or command. With `--tree`, selects whole matching families. |
+| `--tree` | off | Group by process family; with `--mem` or `--cpu`. |
+| `--full` | off | Wrap full paths and commands instead of shortening them; with `--mem` or `--cpu`. |
 | `--mem-sort {memory,cpu,growth}` | `memory` | Sort both memory tables. Growth requires `--mem-watch`. |
 | `--mem-watch SECONDS` | | Refresh memory, showing deltas since the previous snapshot; requires `--mem`. Ctrl-C stops. |
 | `--list` | | Show the groups table and exit. |

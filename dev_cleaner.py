@@ -70,15 +70,16 @@ def scan_expired() -> bool:
 # Scanning rules
 # ---------------------------------------------------------------------------
 
-# Never descend into these while looking for projects. Dot-dirs are *not*
-# blanket-skipped: some (e.g. ~/.pilot) legitimately contain projects.
+# Never descend into these *directly under the home dir* while looking for
+# projects. Dot-dirs are not blanket-skipped: some (e.g. ~/.pilot) legitimately
+# contain projects. Deeper down the same names are ordinary project content: a
+# repo's .claude/worktrees or .cache/ can hold hundreds of checkouts, and go/ is
+# a common package dir.
 SKIP_DIRS = {
     # macOS
     ".Trash", "Library", "Pictures", "Music", "Movies",
     # Linux
     "snap", ".var",
-    # VCS / build tooling
-    ".git", ".hg", ".svn",
     # Global caches / package managers (handled by the global cleaners)
     ".cargo", ".rustup", ".cache", ".npm", ".yarn", ".pnpm", ".bun", ".gem",
     ".gradle", ".m2", ".ivy2", ".bundle", ".cocoapods", ".nuget", ".pub-cache",
@@ -97,6 +98,7 @@ SKIP_DIRS = {
 # pruned from every walk (both project discovery and activity measurement).
 # Notably venvs: site-packages is full of pyproject.toml/package.json files.
 ALWAYS_PRUNE = {
+    ".git", ".hg", ".svn",
     "node_modules", ".venv", "venv", ".tox", ".nox", "site-packages", "__pycache__",
     ".mypy_cache", ".pytest_cache", ".ruff_cache", ".stack-work", "dist-newstyle",
     ".dart_tool", ".zig-cache", "zig-cache", ".terraform", ".gradle", "_build",
@@ -226,6 +228,8 @@ KNOWN_CACHES: tuple[tuple[str, str, str, str, tuple[Path, ...]], ...] = (
      (HOME / ".terraform.d" / "plugin-cache",)),
     ("Trivy cache", "tools", AGGRESSIVE, "vulnerability DB; re-downloaded",
      (MAC_CACHES / "trivy", XDG_CACHE / "trivy")),
+    ("Grype cache", "tools", AGGRESSIVE, "vulnerability DB; re-downloaded",
+     (MAC_CACHES / "grype", XDG_CACHE / "grype")),
     ("Helm cache", "tools", AGGRESSIVE, "re-downloaded", (MAC_CACHES / "helm", XDG_CACHE / "helm")),
     ("Bazel output bases", "tools", AGGRESSIVE, "run `bazel shutdown` first", (XDG_CACHE / "bazel",)),
     ("JetBrains caches", "tools", AGGRESSIVE, "IDE re-indexes projects",
@@ -314,6 +318,14 @@ volumes = {json.dumps(docker_volumes)}
 # executable lives in a temp dir. List more dirs whose executables are only
 # ever meant to run under a parent, e.g. a tool's plugin dir.
 orphan_dirs = []
+# Close terminal sessions (tmux panes, tabs: agents and shells left open) whose
+# terminal saw no input or output for this many days and where nothing ran or
+# started since.
+# A session holds its unsaved state: raise the age, or set false to keep them all.
+idle_session_days = 1
+# Stop your own detached programs (dev servers, test binaries, scripts under your
+# home or temp dirs) that have averaged 10% of a core for 6 hours and still are.
+spinning = true
 
 # Disposable dirs of your own: children idle longer than `days` are removed
 # (`days` is optional and defaults to the global one above).
@@ -322,6 +334,7 @@ orphan_dirs = []
 # days = 3
 # include = ["*"]  # direct child names; shell-style wildcards
 # exclude = ["keep-*"]  # exclusions always win
+# keep = 2  # the newest 2 matching children always stay (with days = 0: keep only the latest 2)
 """
 
 
@@ -357,7 +370,7 @@ _dev_cleaner() {{
     COMPREPLY=()
     cur="${{COMP_WORDS[COMP_CWORD]}}"
     prev="${{COMP_WORDS[COMP_CWORD-1]}}"
-    opts="--root --thorough --caches-only --verbose -v --days --hours --dry-run --yes --aggressive --only --skip --audit --docker-audit --mem --mem-top --mem-filter --mem-tree --mem-full --mem-sort --mem-watch --list --sizes --size-jobs --clean-jobs --command-timeout --config --init --show-config --completion -n -y -a -h --help"
+    opts="--root --thorough --caches-only --verbose -v --days --hours --dry-run --yes --aggressive --only --skip --audit --docker-audit --mem --cpu --cpu-sample --top --filter --tree --full --mem-sort --mem-watch --list --sizes --size-jobs --clean-jobs --command-timeout --config --init --show-config --completion -n -y -a -h --help"
     case "$prev" in
         --root|--config) COMPREPLY=( $(compgen -f -- "$cur") ); return ;;
         --completion) COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ); return ;;
@@ -385,11 +398,13 @@ _dev_cleaner() {{
         '--skip[Skip these groups]:groups:_values -s , group {_GROUPS_WS}' \
         '--audit[Show the biggest dirs and how much of each would be freed]' \
         '--docker-audit[Read-only Docker disk, container memory and builder cache inventory]' \
-        '--mem[Show which programs hold the memory and how many are orphaned]' \
-        '--mem-top[Rows per memory table]:N:' \
-        '--mem-filter[Match PID, executable or command]:text:' \
-        '--mem-tree[Group memory by process family]' \
-        '--mem-full[Show full paths and commands]' \
+        '--mem[Show which programs and silent terminal sessions hold the memory]' \
+        '--cpu[Sample which programs burn CPU now and which have for hours]' \
+        '--cpu-sample[CPU sampling window]:seconds:' \
+        '--top[Rows per --mem / --cpu table]:N:' \
+        '--filter[Match PID, executable or command]:text:' \
+        '--tree[Group by process family]' \
+        '--full[Show full paths and commands]' \
         '--mem-sort[Sort memory tables]:sort:(memory cpu growth)' \
         '--mem-watch[Refresh memory and show growth]:seconds:' \
         '--list[List cleaner groups and exit]' \
@@ -420,11 +435,13 @@ complete -c dev-cleaner -l only -d "Only run these groups" -x -a "{_GROUPS_WS}"
 complete -c dev-cleaner -l skip -d "Skip these groups" -x -a "{_GROUPS_WS}"
 complete -c dev-cleaner -l audit -d "Show the biggest dirs and how much of each would be freed"
 complete -c dev-cleaner -l docker-audit -d "Read-only Docker disk, container memory and builder cache inventory"
-complete -c dev-cleaner -l mem -d "Show which programs hold the memory and how many are orphaned"
-complete -c dev-cleaner -l mem-top -d "Rows per memory table" -x
-complete -c dev-cleaner -l mem-filter -d "Match PID, executable or command" -x
-complete -c dev-cleaner -l mem-tree -d "Group memory by process family"
-complete -c dev-cleaner -l mem-full -d "Show full paths and commands"
+complete -c dev-cleaner -l mem -d "Show which programs and silent terminal sessions hold the memory"
+complete -c dev-cleaner -l cpu -d "Sample which programs burn CPU now and which have for hours"
+complete -c dev-cleaner -l cpu-sample -d "CPU sampling window in seconds" -x
+complete -c dev-cleaner -l top -d "Rows per --mem / --cpu table" -x
+complete -c dev-cleaner -l filter -d "Match PID, executable or command" -x
+complete -c dev-cleaner -l tree -d "Group by process family"
+complete -c dev-cleaner -l full -d "Show full paths and commands"
 complete -c dev-cleaner -l mem-sort -d "Sort memory tables" -x -a "memory cpu growth"
 complete -c dev-cleaner -l mem-watch -d "Refresh memory and show growth" -x
 complete -c dev-cleaner -l list -d "List cleaner groups and exit"
@@ -657,6 +674,7 @@ class Item:
     shadowed: bool = False           # safe item made redundant by an aggressive one
     project: Path | None = None
     ram: bool = False                # size is memory, not disk: shown, never summed
+    cores: float | None = None       # CPU the item gives back, in cores; set on process items that burn it
 
     @property
     def is_project(self) -> bool:
@@ -677,6 +695,8 @@ class Context:
     size_jobs: int
     sweeps: list[Sweep] = field(default_factory=list)  # user-declared, from [[extra]]
     orphan_dirs: list[Path] = field(default_factory=list)  # from [procs], on top of the temp dirs
+    idle_session_days: float | None = 1.0  # from [procs]; None leaves terminal sessions alone
+    stop_spinning: bool = True       # from [procs]: stop detached processes that have burned CPU for hours
     warnings: list[str] = field(default_factory=list)
     measure_active: bool = False     # deep --audit includes sizes of build dirs excluded by activity
     command_timeout: float = 60
@@ -697,7 +717,11 @@ def find_projects(root: Path, extra_skip: set[str] | None = None, *,
                   deadline: float | None = None):
     """Yield (group, project_dir, build_dir, BuildDir) for every build dir under root."""
     root = root.expanduser().resolve()
-    skip = SKIP_DIRS | ALWAYS_PRUNE | (extra_skip or set())
+    skip = ALWAYS_PRUNE | (extra_skip or set())
+    try:
+        home = HOME.resolve()
+    except OSError:
+        home = HOME
     try:
         dev = os.stat(root).st_dev
     except OSError:
@@ -745,8 +769,9 @@ def find_projects(root: Path, extra_skip: set[str] | None = None, *,
                     except OSError:
                         continue
                     yield rule.group, here, p, bd
+        skip_here = skip | SKIP_DIRS if here == home else skip
         pending.extend(Path(dirs[d]) for d in dirnames
-                       if d not in skip and d not in matched and same_fs(dirs[d], dev))
+                       if d not in skip_here and d not in matched and same_fs(dirs[d], dev))
 
 
 def project_activity(project: Path, cutoff: float | None = None, *, deadline: float | None = None) -> float:
@@ -759,7 +784,7 @@ def project_activity(project: Path, cutoff: float | None = None, *, deadline: fl
     """
     if deadline is not None and time.monotonic() >= deadline:
         return float("inf")
-    prune = ALL_BUILD_DIR_NAMES | ALWAYS_PRUNE | {".git", ".hg", ".svn"}
+    prune = ALL_BUILD_DIR_NAMES | ALWAYS_PRUNE
     latest = 0.0
     try:
         project_stat = project.stat()
@@ -1257,7 +1282,7 @@ def run_docker_audit() -> bool:
             table.add_row(human_size(mem), Text(str(d.get("CPUPerc", "?"))), Text(str(d.get("Name", d.get("ID", "?")))))
         console.print(table)
         console.print(Text(f"Reported container memory: {human_size(sum(mem for _, mem in containers))} "
-                           f"across {len(containers)} container(s). Compare with VM processes in --mem-tree.", style="dim"))
+                           f"across {len(containers)} container(s). Compare with VM processes in --mem --tree.", style="dim"))
     else:
         console.print("[yellow]Container memory stats unavailable.[/]")
     console.print(Text("Container stats and host VM footprint use different accounting; their difference is not all VM overhead. "
@@ -1403,6 +1428,7 @@ class Sweep:
     note: str = ""
     include: tuple[str, ...] = ("*",)
     exclude: tuple[str, ...] = ()
+    keep: int = 0                    # newest N matching children per container always stay
 
     def matches(self, name: str) -> bool:
         return (any(fnmatch.fnmatchcase(name, p) for p in self.include)
@@ -1431,10 +1457,13 @@ def extra_sweeps(entries: list[dict], now: float) -> list[Sweep]:
                     for v in values)):
                 raise ValueError(f"[[extra]] {key} must be a list of direct child name patterns (no paths)")
             patterns[key] = tuple(values)
+        keep = e.get("keep", 0)
+        if isinstance(keep, bool) or not isinstance(keep, int) or keep < 0:
+            raise ValueError("[[extra]] keep must be a nonnegative whole number of newest entries to keep")
         d = Path(e["path"]).expanduser().resolve()
-        sweeps.append(Sweep("extra", "idle entries", d, (d,),
+        sweeps.append(Sweep("extra", "idle entries" if not keep else f"all but the newest {keep}", d, (d,),
                             cutoff=now - sweep_days(e["days"]) * 86400 if "days" in e else None,
-                            **patterns))
+                            keep=keep, **patterns))
     return sweeps
 
 
@@ -1477,6 +1506,35 @@ def idle_since(path: Path, depth: int = 2, budget: int = 2000) -> float | None:
                 continue
         level = nxt
     return latest
+
+
+def live_cwds() -> frozenset[Path]:
+    """Every dir that is, or contains, the working directory of one of our running processes.
+
+    mtimes cannot tell an idle database or dev server from an abandoned one: a
+    postgres with no traffic leaves its data dir untouched for days. A process
+    still standing in a dir is the proof that it is in use. Empty when the
+    lookup is unavailable (the mtime checks still apply).
+    """
+    cwds: set[str] = set()
+    proc = Path("/proc")
+    if not IS_MAC and proc.is_dir():
+        for entry in os.scandir(proc):
+            if entry.name.isdigit():
+                try:
+                    cwds.add(os.readlink(os.path.join(entry.path, "cwd")))
+                except OSError:
+                    continue
+    elif lsof := shutil.which("lsof") or ("/usr/sbin/lsof" if os.path.exists("/usr/sbin/lsof") else None):
+        r = run([lsof, "-a", "-d", "cwd", "-Fn"], timeout=15)  # exits 1 when some processes are unreadable
+        if r:
+            cwds.update(line[1:] for line in r.stdout.splitlines() if line.startswith("n/"))
+    busy: set[Path] = set()
+    for cwd in cwds:
+        p = Path(cwd)
+        busy.add(p)
+        busy.update(p.parents)
+    return frozenset(busy)
 
 
 def temp_roots() -> list[Path]:
@@ -1531,8 +1589,12 @@ def tmp_sweeps(ctx: Context | None = None) -> list[Sweep]:
 def _sweep_action(entries: list[Path], cutoff: float) -> Callable[[], str | None]:
     parents = {p: p.parent.resolve() for p in entries}
 
+    busy: frozenset[Path] = frozenset()
+
     def remove(p: Path) -> bool | None:
         if p.parent.resolve() != parents[p]:  # a container was replaced by a symlink
+            return None
+        if p in busy:  # a process moved in since the scan
             return None
         m = idle_since(p)
         if m is None or m >= cutoff:  # back in use (or gone) since the scan
@@ -1547,6 +1609,8 @@ def _sweep_action(entries: list[Path], cutoff: float) -> Callable[[], str | None
             return False
 
     def act() -> str | None:
+        nonlocal busy
+        busy = live_cwds()
         with ThreadPoolExecutor(max_workers=DEFAULTS["clean_jobs"]) as pool:
             results = list(pool.map(remove, entries))
         removed, failed, skipped = results.count(True), results.count(False), results.count(None)
@@ -1566,6 +1630,8 @@ def scan_sweeps(sweeps: list[Sweep], ctx: Context) -> list[Item]:
     reserved.update(p for c in tuple(reserved) for p in c.parents)
     items = []
     selected: set[Path] = set()
+    busy = live_cwds() if sweeps else frozenset()
+    in_use = 0
     for sw in sweeps:
         if scan_expired():
             break
@@ -1578,8 +1644,11 @@ def scan_sweeps(sweeps: list[Sweep], ctx: Context) -> list[Item]:
                 names, dev = os.listdir(c), os.stat(c).st_dev
             except OSError:
                 continue
+            aged: list[tuple[float, Path]] = []
+            complete = True
             for name in names:
                 if scan_expired():
+                    complete = False
                     break
                 p = c / name
                 if (p in reserved or p in selected or not sw.matches(name)
@@ -1588,7 +1657,17 @@ def scan_sweeps(sweeps: list[Sweep], ctx: Context) -> list[Item]:
                 if not same_fs(p, dev):
                     continue
                 m = idle_since(p)
-                if m is not None and m < cutoff:
+                if m is not None:
+                    aged.append((m, p))
+            if sw.keep:
+                if not complete:
+                    continue  # "newest" is unknowable from a partial listing: remove nothing
+                aged = sorted(aged, key=lambda mp: mp[0], reverse=True)[sw.keep:]
+            for m, p in aged:
+                if m < cutoff:
+                    if p in busy:
+                        in_use += 1
+                        continue
                     stale.append(p)
                     selected.add(p)
         if not stale:
@@ -1599,12 +1678,17 @@ def scan_sweeps(sweeps: list[Sweep], ctx: Context) -> list[Item]:
             "; biggest: " + ", ".join(f"{p.name[:28]} {human_size(n)}" for p, n in top) if top else "")
         if sw.include != ("*",) or sw.exclude:
             note += f"; include={list(sw.include)!r}, exclude={list(sw.exclude)!r}"
+        if sw.keep:
+            note += f"; newest {sw.keep} kept"
         items.append(Item(
             group=sw.group, label=sw.label, path=sw.path,
             size=sum(sizes.values()) if len(sizes) == len(stale) else None, tier=SAFE,
             note=f"{sw.note}; {note}" if sw.note else note, mode="action",
             action=_sweep_action(stale, cutoff),
         ))
+    if in_use:
+        ctx.warnings.append(f"{sweeps[0].group}: kept {in_use} idle-looking entr{'y' if in_use == 1 else 'ies'} "
+                            "that a running process is working in")
     return items
 
 
@@ -1632,6 +1716,8 @@ class Proc:
     exe: str
     started: str = ""                # ps lstart: distinguish recycled PIDs between snapshots
     footprint: bool = False          # macOS top supplied MEM; otherwise mem is RSS
+    tty: str = ""                    # controlling terminal ("ttys012", "pts/3"); empty when detached
+    cpu_time: float = 0.0            # cumulative CPU seconds: two snapshots give the true current rate
 
     @property
     def name(self) -> str:
@@ -1651,6 +1737,15 @@ def parse_etime(s: str) -> float:
     return int(days or 0) * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
 
 
+def parse_cputime(s: str) -> float:
+    """ps time, [dd-][hh:]mm:ss[.cc] → seconds (macOS lets the minutes run past 59)."""
+    days, _, rest = s.rpartition("-")
+    total = 0.0
+    for part in rest.split(":"):
+        total = total * 60 + float(part)
+    return int(days or 0) * 86400 + total
+
+
 def _footprints() -> dict[int, int]:
     """pid → memory footprint. RSS collapses once a machine swaps, which is exactly when this matters."""
     if not IS_MAC:
@@ -1665,26 +1760,33 @@ def _footprints() -> dict[int, int]:
     return out
 
 
-def list_procs() -> list[Proc]:
-    r = run(["ps", "-A", "-ww", "-o", "pid=,ppid=,uid=,etime=,%cpu=,rss=,lstart=,comm="], timeout=30,
+def list_procs(footprints: bool = True) -> list[Proc]:
+    r = run(["ps", "-A", "-ww", "-o", "pid=,ppid=,uid=,etime=,%cpu=,rss=,tty=,time=,lstart=,comm="], timeout=30,
             env={**os.environ, "LC_ALL": "C"})
     if r is None or r.returncode != 0:
         return []
-    foot = _footprints()
+    foot = _footprints() if footprints else {}
     procs = []
     for line in r.stdout.splitlines():
-        f = line.split(None, 11)
-        if len(f) < 12:
+        f = line.split(None, 13)
+        if len(f) < 14:
             continue
         try:
-            pid, exe = int(f[0]), f[11].strip()
-            if not IS_MAC:  # Linux `comm` is a bare, truncated name
+            pid, exe = int(f[0]), f[13].strip()
+            cpu_time = parse_cputime(f[7])
+            if not IS_MAC:  # Linux `comm` is a bare, truncated name, and ps rounds CPU time to seconds
                 try:
                     exe = os.readlink(f"/proc/{pid}/exe")
                 except OSError:
                     pass
+                try:
+                    fields = Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()
+                    cpu_time = (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+                except (OSError, ValueError, IndexError):
+                    pass
             procs.append(Proc(pid, int(f[1]), int(f[2]), parse_etime(f[3]), float(f[4].replace(",", ".")),
-                              foot.get(pid, int(f[5]) * 1024), exe, " ".join(f[6:11]), pid in foot))
+                              foot.get(pid, int(f[5]) * 1024), exe, " ".join(f[8:13]), pid in foot,
+                              tty="" if f[6].strip("?-") == "" else f[6], cpu_time=cpu_time))
         except ValueError:
             continue
     return procs
@@ -1715,51 +1817,219 @@ def _name_counts(procs: list[Proc], n: int = 5) -> str:
     return ", ".join(f"{name} ×{c}" for name, c in top[:n]) + (f", +{len(top) - n} more" if len(top) > n else "")
 
 
+def _signal_and_wait(targets: list[tuple[Proc, int]], grace: float = 8) -> int:
+    """Send each process its polite signal, then SIGKILL what outlives the grace period. Returns the forced count."""
+    def alive(p: Proc) -> bool:
+        try:
+            os.kill(p.pid, 0)
+            return True
+        except OSError:
+            return False
+
+    def send(p: Proc, sig: int) -> None:
+        try:
+            os.kill(p.pid, sig)
+        except OSError:
+            pass
+
+    for p, sig in targets:
+        send(p, sig)
+    deadline = time.time() + grace
+    while time.time() < deadline and any(alive(p) for p, _ in targets):
+        time.sleep(0.25)
+    stuck = [p for p, _ in targets if alive(p)]
+    if stuck:
+        # A process may exit during the grace period and its PID be reused.
+        identities = {p.identity for p in list_procs()}
+        stuck = [p for p in stuck if p.identity in identities]
+    for p in stuck:
+        send(p, signal.SIGKILL)
+    return len(stuck)
+
+
 def _stop_action(targets: list[Proc], roots: tuple[str, ...], min_age: float) -> Callable[[], str | None]:
     def act() -> str | None:
         # Pids get recycled and orphans get adopted: only signal what still qualifies.
         want = {p.identity for p in targets}
         live = [p for p in find_orphans(list_procs(), roots, min_age)
                 if p.identity in want]
+        forced = _signal_and_wait([(p, signal.SIGTERM) for p in live])  # lets a supervisor tear its children down
+        return f"stopped {len(live)}" + (f" ({forced} forced)" if forced else "")
+    return act
 
-        def alive(p: Proc) -> bool:
-            try:
-                os.kill(p.pid, 0)
-                return True
-            except OSError:
-                return False
 
-        def send(procs: list[Proc], sig: int) -> None:
-            for p in procs:
-                try:
-                    os.kill(p.pid, sig)
-                except OSError:
-                    pass
+SESSION_MIN_MEM = 64 * 1024**2       # a bare idle shell holds nothing worth closing a terminal for
 
-        send(live, signal.SIGTERM)  # lets a supervisor tear its own children down
-        deadline = time.time() + 8
-        while time.time() < deadline and any(alive(p) for p in live):
-            time.sleep(0.25)
-        stuck = [p for p in live if alive(p)]
-        if stuck:
-            # A parent may exit during the grace period and its PID be reused.
-            identities = {p.identity for p in list_procs()}
-            stuck = [p for p in stuck if p.identity in identities]
-        send(stuck, signal.SIGKILL)
-        return f"stopped {len(live)}" + (f" ({len(stuck)} forced)" if stuck else "")
+
+@dataclass(frozen=True)
+class Session:
+    """Everything of ours hanging off one terminal: a tmux pane, a terminal tab, an ssh login."""
+    tty: str
+    idle: float                      # seconds since the terminal last carried input or output
+    procs: tuple[Proc, ...]          # on the tty, plus same-owner descendants that detached from it
+
+    @property
+    def mem(self) -> int:
+        return sum(p.mem for p in self.procs)
+
+    @property
+    def main(self) -> Proc:
+        return max(self.procs, key=lambda p: p.mem)
+
+
+def _own_ttys(procs: list[Proc]) -> set[str]:
+    """Terminals this run sits in (ours and every ancestor's): never candidates."""
+    by_pid = {p.pid: p for p in procs}
+    out, pid, seen = set(), os.getpid(), set()
+    while pid in by_pid and pid not in seen:
+        seen.add(pid)
+        out.add(by_pid[pid].tty)
+        pid = by_pid[pid].ppid
+    try:
+        out.add(os.ttyname(sys.stdin.fileno()).removeprefix("/dev/"))
+    except (OSError, ValueError, AttributeError):
+        pass
+    out.discard("")
+    return out
+
+
+def tty_idle(tty: str, now: float) -> float | None:
+    """Seconds since the terminal last carried output (mtime) or input (atime): the clock `w` reports."""
+    try:
+        st = os.stat(f"/dev/{tty}")
+    except OSError:
+        return None
+    return max(0.0, now - max(st.st_mtime, st.st_atime))
+
+
+def terminal_sessions(procs: list[Proc], now: float | None = None) -> list[Session]:
+    """Group our processes by controlling terminal, with how long each terminal has been silent.
+
+    An agent or shell left open in a tmux pane for days shows up here even
+    though each of its processes looks like any other long-running program.
+    """
+    now = time.time() if now is None else now
+    me = os.getuid()
+    mine = [p for p in procs if p.uid == me]
+    children: dict[int, list[Proc]] = defaultdict(list)
+    for p in mine:
+        children[p.ppid].append(p)
+    members: dict[str, dict[int, Proc]] = defaultdict(dict)
+    for p in mine:
+        if not p.tty:
+            continue
+        members[p.tty][p.pid] = p
+        pending = list(children[p.pid])
+        while pending:  # helpers that dropped the terminal (language servers, MCP servers) die with it
+            q = pending.pop()
+            if q.tty or q.pid in members[p.tty]:
+                continue
+            members[p.tty][q.pid] = q
+            pending.extend(children[q.pid])
+    own = _own_ttys(procs)
+    out = []
+    for tty, found in members.items():
+        if tty in own:
+            continue
+        idle = tty_idle(tty, now)
+        if idle is not None:
+            out.append(Session(tty, idle, tuple(found.values())))
+    return out
+
+
+def idle_sessions(sessions: list[Session], min_idle: float) -> list[Session]:
+    """Silent past the threshold, with nothing started or computing in it since."""
+    return [s for s in sessions
+            if s.idle >= min_idle and s.mem >= SESSION_MIN_MEM
+            and all(p.age >= min_idle and p.cpu <= 1.0 for p in s.procs)]
+
+
+def _close_sessions_action(targets: list[Session], min_idle: float) -> Callable[[], str | None]:
+    def act() -> str | None:
+        # Re-qualify from a fresh snapshot: a session that printed, ran or spawned anything since stays.
+        want = {s.tty: {p.identity for p in s.procs if p.tty} for s in targets}
+        live = [s for s in idle_sessions(terminal_sessions(list_procs()), min_idle)
+                if s.tty in want and want[s.tty] == {p.identity for p in s.procs if p.tty}]
+        # SIGHUP is what closing the terminal sends; detached helpers get SIGTERM.
+        signals = [(p, signal.SIGHUP if p.tty else signal.SIGTERM) for s in live for p in s.procs]
+        forced = _signal_and_wait(signals)
+        kept = len(targets) - len(live)
+        return (f"closed {len(live)} session(s), {len(signals)} processes" + (f" ({forced} forced)" if forced else "")
+                + (f", {kept} back in use" if kept else ""))
     return act
 
 
 def scan_procs(ctx: Context) -> list[Item]:
     roots, min_age = orphan_roots(ctx), time.time() - ctx.cutoff
-    orphans = find_orphans(list_procs(), roots, min_age)
-    if not orphans:
-        return []
-    return [Item(
-        group="procs", label="orphaned processes", size=sum(p.mem for p in orphans), tier=SAFE, ram=True,
-        note=f"{len(orphans)} idle, parent gone: {_name_counts(orphans)}",
-        mode="action", action=_stop_action(orphans, roots, min_age),
-    )]
+    procs = list_procs()
+    items = []
+    orphans = find_orphans(procs, roots, min_age)
+    if orphans:
+        items.append(Item(
+            group="procs", label="orphaned processes", size=sum(p.mem for p in orphans), tier=SAFE, ram=True,
+            note=f"{len(orphans)} idle, parent gone: {_name_counts(orphans)}",
+            mode="action", action=_stop_action(orphans, roots, min_age),
+        ))
+    sessions = terminal_sessions(procs)
+    if ctx.idle_session_days is not None:
+        min_idle = ctx.idle_session_days * 86400
+        idle = idle_sessions(sessions, min_idle)
+        if idle:
+            items.append(Item(
+                group="procs", label="idle terminal sessions", size=sum(s.mem for s in idle), tier=SAFE, ram=True,
+                note=f"{len(idle)} silent ≥{ctx.idle_session_days:g}d, {sum(len(s.procs) for s in idle)} processes: "
+                     + _name_counts([s.main for s in idle]),
+                mode="action", action=_close_sessions_action(idle, min_idle),
+            ))
+    if ctx.stop_spinning:
+        spinning = find_spinning(procs)
+        if spinning:
+            cores = sum(p.cpu_time / p.age for p in spinning)
+            items.append(Item(
+                group="procs", label="spinning processes", size=sum(p.mem for p in spinning), tier=SAFE, ram=True,
+                cores=cores,
+                note=f"{len(spinning)} detached, busy ≥{_duration(SPIN_AGE)} "
+                     f"({sum(p.cpu_time for p in spinning) / 3600:.1f} CPU-hours so far): {_name_counts(spinning)}",
+                mode="action", action=_stop_spinning_action(spinning),
+            ))
+    return items
+
+
+SPIN_AGE = 6 * 3600                  # running this long ...
+SPIN_AVG = 10.0                      # ... at this % of a core on average since it started ...
+SPIN_NOW = 5.0                       # ... and still at it
+
+
+def find_spinning(procs: list[Proc]) -> list[Proc]:
+    """Our own detached programs that have burned CPU for hours and still do.
+
+    Only executables under the home dir or a temp dir qualify: dev servers,
+    venv interpreters, test binaries. Apps, system daemons, package-manager
+    installs and VMs are someone else's to judge, and anything attached to a
+    terminal is a job somebody is watching.
+    """
+    me = os.getuid()
+    by_pid = {p.pid: p for p in procs}
+    own, pid = set(), os.getpid()
+    while pid in by_pid and pid not in own:
+        own.add(pid)
+        pid = by_pid[pid].ppid
+    roots = tuple(sorted({str(d).rstrip("/") + "/" for base in (HOME, Path("/tmp"), Path(tempfile.gettempdir()))
+                          for d in (base, base.resolve())}))
+    return [p for p in procs
+            if p.uid == me and not p.tty and p.pid not in own and p.age >= SPIN_AGE
+            and p.cpu_time / p.age * 100 >= SPIN_AVG and p.cpu >= SPIN_NOW and p.exe.startswith(roots)]
+
+
+def _stop_spinning_action(targets: list[Proc]) -> Callable[[], str | None]:
+    def act() -> str | None:
+        want = {p.identity for p in targets}
+        live = [p for p in find_spinning(list_procs()) if p.identity in want]  # it calmed down or exited: leave it
+        forced = _signal_and_wait([(p, signal.SIGTERM) for p in live])
+        kept = len(targets) - len(live)
+        return (f"stopped {len(live)}" + (f" ({forced} forced)" if forced else "")
+                + (f", {kept} no longer spinning" if kept else ""))
+    return act
 
 
 def system_memory() -> dict[str, int]:
@@ -1949,9 +2219,199 @@ def render_memory(procs: list[Proc], ctx: Context, *, previous: list[Proc] | Non
                           style="yellow"))
         parts.append(Text("Cleanup targets the qualifying parents; children depend on their shutdown behavior. "
                           "PPID 1 alone does not mean a process is abandoned.", style="dim"))
-    parts.append(Text("Use --mem-tree for app/session totals, --mem-filter TEXT to narrow down, "
-                      "and --mem-watch 5 --mem-sort growth to track growth. Read-only; Ctrl-C stops watching.", style="dim"))
+    parts.extend(render_sessions(procs, ctx, commands, top=top, full=full))
+    parts.append(Text("Use --tree for app/session totals, --filter TEXT to narrow down, "
+                      "--mem-watch 5 --mem-sort growth to track growth, and --cpu for what is burning CPU. "
+                      "Read-only; Ctrl-C stops watching.", style="dim"))
     return Group(*parts)
+
+
+def _duration(seconds: float) -> str:
+    return f"{seconds / 86400:.1f}d" if seconds >= 86400 else f"{seconds / 3600:.1f}h" if seconds >= 3600 else f"{seconds / 60:.0f}m"
+
+
+def render_sessions(procs: list[Proc], ctx: Context, commands: dict[int, str], *, top: int = 10,
+                    full: bool = False) -> list:
+    """Terminals that went quiet while their programs kept the memory."""
+    configured = ctx.idle_session_days is not None
+    min_idle = ctx.idle_session_days * 86400 if configured else 86400.0
+    idle = sorted(idle_sessions(terminal_sessions(procs), min_idle), key=lambda s: (-s.mem, s.tty))
+    if not idle:
+        return []
+    table = Table(title=f"💤  terminal sessions silent ≥{_duration(min_idle)} (no input, output, new process or CPU)",
+                  box=ROUNDED, border_style="magenta", title_justify="left", expand=True)
+    for label in ("memory", "silent", "procs", "oldest"):
+        table.add_column(label, justify="right")
+    table.add_column("tty")
+    table.add_column("largest process", overflow="fold" if full else "ellipsis", no_wrap=not full, ratio=2)
+    for s in idle[:top]:
+        command = commands.get(s.main.pid, s.main.exe)
+        if not full and command.startswith(s.main.exe):
+            command = s.main.name + command[len(s.main.exe):]
+        table.add_row(Text(human_size(s.mem), style=size_color(s.mem)), _duration(s.idle), str(len(s.procs)),
+                      _duration(max(p.age for p in s.procs)), s.tty, Text(f"{s.main.pid} {tilde(command)}"))
+    total = (f"{len(idle)} silent session(s) hold {human_size(sum(s.mem for s in idle))} across "
+             f"{sum(len(s.procs) for s in idle)} processes: {_name_counts([s.main for s in idle], 3)}. ")
+    action = ("Running dev-cleaner offers to close them." if configured else
+              "Closing them is turned off ([procs] idle_session_days = false).")
+    return [table, Text(total + action, style="yellow")]
+
+
+# Daemons whose CPU is a symptom of something else on the machine.
+CPU_HINTS = {
+    "mds": "Spotlight indexing", "mds_stores": "Spotlight indexing", "mdworker_shared": "Spotlight indexing",
+    "fseventsd": "file-change notifications",
+    "kernel_task": "kernel work",
+    "tracker-miner-fs-3": "desktop file indexing", "baloo_file": "desktop file indexing",
+}
+CPU_HINT_ADVICE = {
+    "Spotlight indexing": "Spotlight is indexing files as they change: exclude checkout, worktree and cache dirs under "
+                          "System Settings › Spotlight › Search Privacy (or `sudo mdutil -i off <volume>`).",
+    "file-change notifications": "fseventsd fans every file change out to watchers; heavy use follows mass writes and "
+                                 "deletes (builds, installs, caches) and file watchers on large trees.",
+    "kernel work": "kernel_task CPU on macOS is usually memory compression or thermal throttling: check --mem.",
+    "desktop file indexing": "The desktop indexer is crawling changing files: exclude build and cache dirs from it.",
+}
+VM_NAMES = ("OrbStack Helper", "com.docker.virtualization", "com.docker.hyperkit", "qemu-system", "limactl", "vfkit")
+SUSTAINED_AGE = 3600                 # a burner is "sustained" once it has run for an hour ...
+SUSTAINED_AVG = 10.0                 # ... averaging at least this % of a core since it started
+
+
+def cpu_rates(before: list[Proc], after: list[Proc], elapsed: float) -> dict[int, float]:
+    """pid → % of one core used between two snapshots. Processes that came and went in between are invisible."""
+    if elapsed <= 0:
+        return {}
+    old = {p.identity: p.cpu_time for p in before}
+    rates = {}
+    for p in after:
+        if p.identity in old:
+            rates[p.pid] = max(0.0, p.cpu_time - old[p.identity]) / elapsed * 100
+        elif p.age <= elapsed + 1:  # started during the sample
+            rates[p.pid] = p.cpu_time / elapsed * 100
+    return rates
+
+
+def render_cpu(before: list[Proc], procs: list[Proc], elapsed: float, *, commands: dict[int, str] | None = None,
+               top: int = 10, pattern: str = "", by_tree: bool = False, full: bool = False) -> Group:
+    commands = commands or {}
+    rates = cpu_rates(before, procs, elapsed)
+    needle = pattern.casefold()
+    groups = group_procs(procs, by_tree)
+    if needle:
+        def matches(p: Proc) -> bool:
+            return needle in f"{p.pid} {p.exe} {commands.get(p.pid, '')}".casefold()
+        if by_tree:
+            groups = [(root, members) for root, members in groups if any(matches(p) for p in members)]
+        else:
+            groups = [(root, [p for p in members if matches(p)]) for root, members in groups]
+        groups = [(root, members) for root, members in groups if members]
+    selected = [p for _, members in groups for p in members]
+
+    def now(members: list[Proc]) -> float:
+        return sum(rates.get(p.pid, 0.0) for p in members)
+
+    def average(p: Proc) -> float:
+        return p.cpu_time / p.age * 100 if p.age > 0 else 0.0
+
+    def command(p: Proc) -> str:
+        text = commands.get(p.pid, p.exe)
+        if not full and text.startswith(p.exe):
+            text = p.name + text[len(p.exe):]
+        return tilde(text)
+
+    def minutes(seconds: float) -> str:
+        return f"{seconds / 3600:.1f}h" if seconds >= 3600 else f"{seconds / 60:.1f}m"
+
+    groups.sort(key=lambda row: (-now(row[1]), -sum(p.cpu_time for p in row[1]), row[0].pid))
+    parts: list = []
+    cores = os.cpu_count() or 1
+    busy = sum(rates.values()) / 100
+    try:
+        load = os.getloadavg()
+        ratio = load[0] / cores
+        parts.append(Text.assemble(
+            ("load: ", "bold"), (f"{load[0]:.1f}", "red bold" if ratio > 2 else "yellow bold" if ratio > 1 else "green bold"),
+            (f" {load[1]:.1f} {load[2]:.1f} (1/5/15 min) on {cores} cores", "bold"),
+            (f"  •  {ratio:.1f}× the cores wanted at once" if ratio > 1 else "", "bold")))
+    except OSError:
+        parts.append(Text(f"{cores} cores", style="bold"))
+    parts.append(Text(f"{time.strftime('%H:%M:%S')}  •  {len(selected)} / {len(procs)} processes  •  "
+                      f"sampled {elapsed:.1f}s: {busy:.1f} of {cores} cores busy in processes that lived through it",
+                      style="dim"))
+    parts.append(Text("now % is measured over the sample (100 = one full core); avg % is CPU time over lifetime. "
+                      "Short-lived processes (compilers, test binaries) start and exit between samples and are not "
+                      "attributed: a load far above the busy cores means many of them, or processes waiting on disk.",
+                      style="dim"))
+
+    table = Table(title="🔥  CPU by " + ("process family" if by_tree else "program (reported executable)"),
+                  box=ROUNDED, border_style="magenta", title_justify="left", expand=True)
+    for label in ("now %", "CPU time", "memory", "procs"):
+        table.add_column(label, justify="right")
+    table.add_column("root PID" if by_tree else "top PID", justify="right")
+    table.add_column("program", overflow="fold" if full else "ellipsis", no_wrap=not full, ratio=2)
+    for root, members in groups[:top]:
+        shown = root if by_tree else max(members, key=lambda p: rates.get(p.pid, 0.0))
+        rate = now(members)
+        table.add_row(Text(f"{rate:.1f}", style="red bold" if rate >= 100 else "yellow" if rate >= 25 else ""),
+                      minutes(sum(p.cpu_time for p in members)), human_size(sum(p.mem for p in members)),
+                      str(len(members)), str(shown.pid),
+                      Text(tilde(root.exe) if full or root.exe == root.name else f"{root.name} ({tilde(root.exe)})"))
+    if not selected:
+        parts.append(Text(f"No processes match {pattern!r}." if pattern else "No processes found.", style="yellow"))
+    parts.append(table)
+
+    def process_table(title: str, rows: list[Proc]) -> Table:
+        t = Table(title=title, box=ROUNDED, border_style="magenta", title_justify="left", expand=True)
+        for label in ("PID", "PPID", "now %", "avg %", "CPU time", "age", "memory"):
+            t.add_column(label, justify="right")
+        t.add_column("command", overflow="fold" if full else "ellipsis", no_wrap=not full, ratio=2)
+        for p in rows:
+            rate = rates.get(p.pid)
+            t.add_row(str(p.pid), str(p.ppid), "—" if rate is None else f"{rate:.1f}", f"{average(p):.1f}",
+                      minutes(p.cpu_time), _duration(p.age), human_size(p.mem),
+                      Text(command(p) + ("" if p.uid == os.getuid() else f"  (uid {p.uid})")))
+        return t
+
+    current = sorted(selected, key=lambda p: (-rates.get(p.pid, 0.0), -p.cpu_time, p.pid))
+    parts.append(process_table("🔎  busiest processes right now", current[:top]))
+    sustained = sorted((p for p in selected if p.age >= SUSTAINED_AGE and average(p) >= SUSTAINED_AVG),
+                       key=lambda p: (-p.cpu_time, p.pid))
+    if sustained:
+        parts.append(process_table(
+            f"⏳  sustained: running ≥{_duration(SUSTAINED_AGE)} at ≥{SUSTAINED_AVG:g}% of a core on average "
+            f"({len(sustained)} processes, {sum(average(p) for p in sustained) / 100:.1f} cores)", sustained[:top]))
+        parts.append(Text("A server or agent that has averaged a steady share of a core for hours is either working "
+                          "or spinning. Running dev-cleaner offers to stop your own detached ones once they "
+                          f"have kept it up for {_duration(SPIN_AGE)}.", style="dim"))
+    shown = {p.name for p in current[:top]} | {p.name for p in sustained[:top]}
+    for hint in dict.fromkeys(CPU_HINTS[name] for name in sorted(shown) if name in CPU_HINTS):
+        parts.append(Text(CPU_HINT_ADVICE[hint], style="yellow"))
+    if any(name.startswith(VM_NAMES) for name in shown):
+        parts.append(Text("A VM helper's CPU and memory belong to the containers inside it: "
+                          "dev-cleaner --docker-audit lists them.", style="yellow"))
+    parts.append(Text("Use --tree for whole apps/sessions, --filter TEXT to narrow down, --cpu-sample N for a longer "
+                      "sample, and --mem for memory. Read-only.", style="dim"))
+    return Group(*parts)
+
+
+def run_cpu(*, sample: float = 2.0, top: int = 10, pattern: str = "", by_tree: bool = False,
+            full: bool = False) -> bool:
+    """Two snapshots: `ps` alone only offers a decaying or lifetime average."""
+    before = list_procs(footprints=False)
+    started = time.monotonic()
+    if not before:
+        console.print("[yellow]cpu: could not list processes[/]")
+        return False
+    with console.status(f"[dim]sampling CPU for {sample:g}s…[/]"):
+        time.sleep(sample)
+    elapsed = time.monotonic() - started
+    procs = list_procs()  # memory footprints are read after the sample so `top` does not sit inside it
+    if not procs:
+        console.print("[yellow]cpu: could not list processes[/]")
+        return False
+    console.print(render_cpu(before, procs, elapsed, commands=process_commands(), top=top, pattern=pattern,
+                             by_tree=by_tree, full=full))
+    return True
 
 
 def run_mem(ctx: Context, *, top: int = 10, pattern: str = "", by_tree: bool = False,
@@ -2010,10 +2470,11 @@ GROUP_HELP: dict[str, tuple[str, str]] = {
                "all unused images (image prune -a)"),
     "brew": ("brew cleanup --prune=all", "brew autoremove"),
     "xcode": ("DerivedData, simulator caches, unavailable simulators", "*OS DeviceSupport"),
-    "tools": ("ccache, kubectl cache", "playwright/puppeteer/cypress browsers, electron, deno, trivy, helm, bazel, JetBrains caches"),
+    "tools": ("ccache, kubectl cache", "playwright/puppeteer/cypress browsers, electron, deno, trivy, grype, helm, bazel, JetBrains caches"),
     "tmp": ("entries of /tmp and $TMPDIR, and Claude Code session scratch, idle past the threshold", ""),
     "extra": ("idle children of the dirs listed under [[extra]] in the config", ""),
-    "procs": ("stops idle orphaned processes (parent gone) running from a temp dir or a [procs] orphan_dirs dir", ""),
+    "procs": ("stops idle orphaned processes (parent gone) running from a temp dir or a [procs] orphan_dirs dir; "
+              "closes terminal sessions silent for a day; stops your detached programs that have burned CPU for hours", ""),
 }
 
 
@@ -2188,25 +2649,57 @@ def disk_line(path: Path = HOME) -> Text:
     )
 
 
+def health_lines() -> list[Text]:
+    """Memory and CPU at a glance, next to the disk line. Missing counters are left out, never guessed."""
+    out = []
+    mem = system_memory()
+    if "RAM" in mem:
+        ram, swap = mem["RAM"], mem.get("swap_used", 0)
+        squeezed = mem.get("compressed", 0) + swap if "available" not in mem else ram - mem["available"]
+        ratio = squeezed / ram if ram else 0
+        color = "red bold" if ratio > (0.5 if "available" not in mem else 0.9) else "yellow" if ratio > (0.25 if "available" not in mem else 0.75) else "green"
+        detail = (f"{human_size(mem['available'])} available" if "available" in mem else
+                  f"{human_size(mem.get('compressed', 0))} compressed")
+        out.append(Text.from_markup(
+            f"[dim]memory:[/] [{color}]{detail}[/] [dim]of {human_size(ram)}"
+            + (f", {human_size(swap)} swapped" if swap else "") + "[/]"))
+    try:
+        load, cores = os.getloadavg()[0], os.cpu_count() or 1
+        color = "red bold" if load > 2 * cores else "yellow" if load > cores else "green"
+        out.append(Text.from_markup(f"[dim]cpu:[/] [{color}]load {load:.1f}[/] [dim]on {cores} cores[/]"))
+    except OSError:
+        pass
+    return out
+
+
 def banner() -> Panel:
     title = Text("🧹  dev-cleaner", style="bold magenta")
-    subtitle = Text("\nsweep stale build dirs & dev caches so your disk stops filling up", style="dim")
-    return Panel(Group(title, subtitle, disk_line()), box=ROUNDED, border_style="magenta",
+    subtitle = Text("\nfree the disk, memory and CPU that dev work leaves behind", style="dim")
+    return Panel(Group(title, subtitle, disk_line(), *health_lines()), box=ROUNDED, border_style="magenta",
                  padding=(0, 2))
 
 
 def render_summary(items: list[Item], threshold: str, aggressive: bool) -> Table:
-    table = Table(title=f"Cleanup · project dirs idle >{threshold}" + (" · aggressive" if aggressive else ""),
+    table = Table(title=f"Cleanup · disk, memory and CPU · project dirs idle >{threshold}"
+                        + (" · aggressive" if aggressive else ""),
                   box=ROUNDED, expand=True, title_justify="left")
     table.add_column("Cleaner", no_wrap=True)
     table.add_column("Targets", justify="right", no_wrap=True)
-    measured = any(i.size is not None for i in items)
+    running = [i for i in items if i.ram]
+    items = [i for i in items if not i.ram]
+    measured = any(i.size is not None for i in items) or bool(running)
     if measured:
-        table.add_column("Size", justify="right", no_wrap=True)
+        table.add_column("Frees", justify="right", no_wrap=True)
     table.add_column("Includes", no_wrap=True, overflow="ellipsis", ratio=1)
     groups: dict[str, list[Item]] = defaultdict(list)
     for item in items:
         groups[item.group].append(item)
+    if running:  # memory and CPU first: they are what makes the machine slow right now
+        for n, item in enumerate(running):
+            frees = Text(human_size(item.size) + " RAM" + (f" · {item.cores:.1f} cores" if item.cores else ""),
+                         style="cyan")
+            table.add_row("🧠 memory" if not item.cores else "🔥 cpu", item.note.split(" ", 1)[0], frees,
+                          Text(f"{item.label}: {item.note}"), end_section=n == len(running) - 1 and bool(groups))
     for group, members in groups.items():
         labels = list(dict.fromkeys(i.label for i in members))
         detail = ", ".join(labels[:4]) + (f", +{len(labels) - 4} more" if len(labels) > 4 else "")
@@ -2322,17 +2815,87 @@ def render_groups_table() -> Table:
 # ---------------------------------------------------------------------------
 
 AUDIT_MIN = 1024**3
-AUDIT_DEPTH = 3
 AUDIT_ROWS = 30
 
 
 def audit_rows(du_out: str, root: Path, min_bytes: int = AUDIT_MIN) -> list[tuple[Path, int]]:
     """Reduce `du -k -d N` output to the dirs worth showing: big ones, as deep as the bulk goes."""
+    return audit_pick(_du_sizes(du_out), root, min_bytes)
+
+
+def _du_sizes(du_out: str) -> dict[Path, int]:
     size: dict[Path, int] = {}
     for line in du_out.splitlines():
         kb, _, name = line.partition("\t")
         if kb.isdigit():
             size[Path(name)] = int(kb) * 1024
+    return size
+
+
+def audit_sizes(root: Path, workers: int, on_done: Callable[[int, int, int], None] | None = None,
+                timeout: float = 3600) -> tuple[dict[Path, int], list[Path]]:
+    """`du -x -d 3` of root, as one `du` per second-level dir run in parallel.
+
+    A single du over a home dir with millions of files is one thread for many
+    minutes. The top two levels are listed here (loose files counted from their
+    block counts, mount points left out like `du -x`), and each dir below gets
+    its own du. Returns the sizes and the dirs whose du did not finish.
+    """
+    try:
+        dev = os.stat(root).st_dev
+    except OSError:
+        return {}, []
+    size: dict[Path, int] = defaultdict(int)
+    jobs: list[Path] = []
+
+    def listing(d: Path, depth: int) -> None:
+        size[d] += 0
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            return
+        for e in entries:
+            try:
+                st = e.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if not stat.S_ISDIR(st.st_mode):
+                size[d] += st.st_blocks * 512
+            elif st.st_dev == dev:
+                if depth:
+                    jobs.append(Path(e.path))
+                else:
+                    listing(Path(e.path), 1)
+
+    listing(root, 0)
+    failed: list[Path] = []
+    measured = 0
+
+    def measure(d: Path) -> tuple[Path, dict[Path, int] | None]:
+        r = run(["du", "-x", "-k", "-d", "1", str(d)], timeout=timeout)
+        if r is None:
+            return d, None
+        # du exits 1 on dirs the OS will not let it read: what it did total is still good,
+        # and a dir it could not open at all (macOS privacy-protected ones) counts as empty.
+        return d, _du_sizes(r.stdout) or {d: 0}
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        for n, done in enumerate(as_completed([pool.submit(measure, j) for j in jobs]), 1):
+            d, sizes = done.result()
+            if sizes is None:
+                failed.append(d)
+            else:
+                measured += sizes.get(d, 0)
+                size.update({p: v for p, v in sizes.items() if p != d})
+                size[d] = sizes.get(d, 0)
+                size[d.parent] += size[d]
+            if on_done:
+                on_done(n, len(jobs), measured)
+    size[root] += sum(v for p, v in size.items() if p.parent == root and p != root)
+    return dict(size), sorted(failed)
+
+
+def audit_pick(size: dict[Path, int], root: Path, min_bytes: int = AUDIT_MIN) -> list[tuple[Path, int]]:
     kids: dict[Path, list[Path]] = defaultdict(list)
     for d in size:
         kids[d.parent].append(d)
@@ -2355,12 +2918,17 @@ def covered(d: Path, total: int, items: list[Item]) -> int:
     """How much of dir `d` the given items would free."""
     n = 0
     for it in items:
-        if it.path is None or not it.size:
+        if it.path is None:
             continue
-        if it.path == d or d in it.path.parents:
+        if it.path == d or it.path in d.parents:
+            # A cache item takes this whole dir even when its size was not measured. A pruning
+            # command of unknown yield (uv cache prune) and a sweep of some of a dir's children
+            # (tmp, extra) promise nothing beyond what they measured.
+            if it.size or (it.size is None and not it.shadowed and it.group not in ("tmp", "extra")):
+                return total
+            continue
+        if it.size and d in it.path.parents:
             n += it.size
-        elif it.path in d.parents:
-            return total
     return min(n, total)
 
 
@@ -2372,9 +2940,9 @@ def run_audit(ctx: Context, to_clean: list[Item], active: list[Item], extra: lis
     with make_progress() as progress:
         task = progress.add_task(f"measuring {tilde(home)} (this walks everything; minutes on a full disk)",
                                  detail="", total=None)
-        r = run(["du", "-x", "-k", "-d", str(AUDIT_DEPTH), str(home)], timeout=3600)
-        if r is not None:  # du exits 1 on the dirs macOS won't let it read; the rest is still good
-            rows += audit_rows(r.stdout, home)
+        sizes, unmeasured = audit_sizes(home, ctx.size_jobs, lambda done, total, measured: progress.update(
+            task, detail=f"{done}/{total} dirs · {human_size(measured)} so far"))
+        rows += audit_pick(sizes, home)
         progress.update(task, description="measuring temp dirs")
         rows += [(d, n) for d, n in paths_size(swept, ctx.size_jobs).items() if n >= AUDIT_MIN]
     if not rows:
@@ -2413,6 +2981,10 @@ def run_audit(ctx: Context, to_clean: list[Item], active: list[Item], extra: lis
     console.print(table)
     if len(rows) > AUDIT_ROWS:
         console.print(f"[dim]+{len(rows) - AUDIT_ROWS} smaller dir(s) not shown[/]")
+    if unmeasured:
+        console.print(Text(f"! could not measure {len(unmeasured)} dir(s), left out of the sizes above: "
+                           + ", ".join(tilde(d) for d in unmeasured[:5])
+                           + (f", +{len(unmeasured) - 5} more" if len(unmeasured) > 5 else ""), style="yellow"))
     if blind and partial:
         console.print(Text.from_markup(
             f"[yellow]![/] [dim]{human_size(blind)} is not covered by the groups run; skipped:[/] "
@@ -2710,11 +3282,18 @@ def main() -> int:
     reports.add_argument("--docker-audit", action="store_true",
                          help="Show Docker disk usage, container memory and per-builder caches; changes nothing")
     reports.add_argument("--mem", action="store_true",
-                         help="Show memory by program plus individual PIDs and commands; changes nothing")
-    p.add_argument("--mem-top", type=int, metavar="N", help="Rows per memory table (default 10; requires --mem)")
-    p.add_argument("--mem-filter", metavar="TEXT", help="Match PID, executable or command (requires --mem)")
-    p.add_argument("--mem-tree", action="store_true", help="Group by process family (requires --mem)")
-    p.add_argument("--mem-full", action="store_true", help="Show full paths and commands, wrapping to fit (requires --mem)")
+                         help="Show memory by program, individual PIDs and silent terminal sessions; changes nothing")
+    reports.add_argument("--cpu", action="store_true",
+                         help="Sample which programs burn CPU now and which have for hours; changes nothing")
+    p.add_argument("--cpu-sample", type=float, metavar="SECONDS", help="CPU sampling window (default 2; requires --cpu)")
+    p.add_argument("--top", "--mem-top", dest="mem_top", type=int, metavar="N",
+                   help="Rows per table (default 10; with --mem or --cpu)")
+    p.add_argument("--filter", "--mem-filter", dest="mem_filter", metavar="TEXT",
+                   help="Match PID, executable or command (with --mem or --cpu)")
+    p.add_argument("--tree", "--mem-tree", dest="mem_tree", action="store_true",
+                   help="Group by process family (with --mem or --cpu)")
+    p.add_argument("--full", "--mem-full", dest="mem_full", action="store_true",
+                   help="Show full paths and commands, wrapping to fit (with --mem or --cpu)")
     p.add_argument("--mem-sort", choices=("memory", "cpu", "growth"), help="Sort memory tables (default memory)")
     p.add_argument("--mem-watch", type=float, metavar="SECONDS", help="Refresh memory and show growth (requires --mem)")
     p.add_argument("--list", action="store_true", help="List cleaner groups and exit")
@@ -2730,11 +3309,15 @@ def main() -> int:
     args = p.parse_args()
     if args.audit and args.caches_only:
         p.error("--audit cannot be combined with --caches-only")
-    if not args.mem and any((args.mem_top is not None, args.mem_filter is not None, args.mem_tree, args.mem_full,
-                             args.mem_sort is not None, args.mem_watch is not None)):
-        p.error("--mem-top, --mem-filter, --mem-tree, --mem-full, --mem-sort and --mem-watch require --mem")
+    if not (args.mem or args.cpu) and any((args.mem_top is not None, args.mem_filter is not None,
+                                           args.mem_tree, args.mem_full)):
+        p.error("--top, --filter, --tree and --full require --mem or --cpu")
+    if not args.mem and (args.mem_sort is not None or args.mem_watch is not None):
+        p.error("--mem-sort and --mem-watch require --mem")
+    if args.cpu_sample is not None and (not args.cpu or not math.isfinite(args.cpu_sample) or args.cpu_sample <= 0):
+        p.error("--cpu-sample requires --cpu and a finite positive number of seconds")
     if args.mem_top is not None and args.mem_top < 1:
-        p.error("--mem-top must be a positive integer")
+        p.error("--top must be a positive integer")
     if args.mem_watch is not None and (not math.isfinite(args.mem_watch) or args.mem_watch <= 0):
         p.error("--mem-watch must be a finite positive number of seconds")
     if args.mem_sort == "growth" and args.mem_watch is None:
@@ -2749,6 +3332,11 @@ def main() -> int:
         return 0
 
     console.print(banner())
+    if args.cpu:
+        ok = run_cpu(sample=args.cpu_sample or 2.0, top=args.mem_top or 10, pattern=args.mem_filter or "",
+                     by_tree=args.mem_tree, full=args.mem_full)
+        console.print("\n[dim]cpu — no changes made.[/]\n")
+        return 0 if ok else 1
     if args.docker_audit:
         ok = run_docker_audit()
         console.print("\n[dim]docker audit — no changes made.[/]\n")
@@ -2815,6 +3403,15 @@ def main() -> int:
 
     procs_cfg = cfg.get("procs") if isinstance(cfg.get("procs"), dict) else {}
     orphan_dirs = [Path(str(d)) for d in procs_cfg.get("orphan_dirs") or []]
+    idle_session_days = procs_cfg.get("idle_session_days", 1.0)
+    if idle_session_days is False:
+        idle_session_days = None
+    elif (idle_session_days is True or not isinstance(idle_session_days, (int, float))
+          or not math.isfinite(idle_session_days) or idle_session_days <= 0):
+        p.error("procs.idle_session_days must be a finite positive number of days, or false to leave sessions alone")
+    stop_spinning = procs_cfg.get("spinning", True)
+    if not isinstance(stop_spinning, bool):
+        p.error("procs.spinning must be true or false")
 
     if args.show_config:
         src = ("legacy rust-clean config" if legacy else "config file") if cfg_path.exists() else "built-in defaults"
@@ -2831,8 +3428,12 @@ def main() -> int:
         for s in sweeps:
             days = (now - s.cutoff) / 86400 if s.cutoff is not None else age_hours / 24
             console.print(f"  [bold]extra[/]       = {escape(tilde(s.path))}; days={days:g}; "
-                          f"include={escape(repr(list(s.include)))}; exclude={escape(repr(list(s.exclude)))}")
+                          f"include={escape(repr(list(s.include)))}; exclude={escape(repr(list(s.exclude)))}"
+                          + (f"; keep={s.keep}" if s.keep else ""))
         console.print(f"  [bold]procs.orphan_dirs[/] = {[str(d) for d in orphan_dirs]}")
+        console.print(f"  [bold]procs.idle_session_days[/] = "
+                      f"{'off' if idle_session_days is None else format(idle_session_days, 'g')}")
+        console.print(f"  [bold]procs.spinning[/] = {stop_spinning}")
         console.print(f"  [bold]size_jobs[/]   = {size_jobs}")
         console.print(f"  [bold]clean_jobs[/]  = {clean_jobs}\n")
         console.print(f"  [bold]command_timeout[/] = {command_timeout:g}s")
@@ -2846,6 +3447,7 @@ def main() -> int:
         roots=roots, cutoff=now - age_hours * 3600, extra_skip=extra_skip,
         groups=groups, aggressive=aggressive,
         docker_volumes=docker_volumes, size_jobs=size_jobs, sweeps=sweeps, orphan_dirs=orphan_dirs,
+        idle_session_days=idle_session_days, stop_spinning=stop_spinning,
         measure_active=args.audit,
         command_timeout=command_timeout,
         measure_sizes=args.sizes or args.audit,
@@ -2905,7 +3507,7 @@ def main() -> int:
             + (f"  ([yellow]{result.deferred} incomplete/skipped[/])" if result.deferred else "")
             + (f"  ([red]{result.failed} failed[/])" if result.failed else "")
             + f"  •  freed [bold green]{human_size(freed)}[/]" + estimate)
-    console.print(Panel(Group(Text.from_markup(body), disk_line()),
+    console.print(Panel(Group(Text.from_markup(body), disk_line(), *health_lines()),
                         border_style="yellow" if result.failed or result.deferred else "green", box=ROUNDED))
     return 1 if result.failed or result.deferred else 0
 
