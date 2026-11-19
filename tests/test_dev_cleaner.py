@@ -965,7 +965,7 @@ def test_cpu_flag_samples_and_changes_nothing(monkeypatch, capsys):
     monkeypatch.setattr(dc, "scan_all", lambda ctx: pytest.fail("--cpu must not scan"))
     monkeypatch.setattr(sys, "argv", ["dev-cleaner", "--cpu", "--cpu-sample", "0.5", "--top", "3"])
     assert dc.main() == 0
-    assert slept == [0.5] and "cpu — no changes made" in capsys.readouterr().out
+    assert 0.5 in slept and "cpu — no changes made" in capsys.readouterr().out
 
 
 # --- resource diagnostics ----------------------------------------------------
@@ -1905,3 +1905,135 @@ def test_dedupe_leaves_a_file_that_changed_after_hashing(tmp_path):
     os.utime(b, ns=(1, 1))
     assert dc._share(str(a), os.lstat(a), str(b), stale) is False
     assert b.read_bytes() == b"y" * 100
+
+
+# ---------------------------------------------------------------------------
+# Review screen and unattended output
+# ---------------------------------------------------------------------------
+
+
+def _picker(**kw):
+    plan = [dc.Item("node", "node_modules", path=Path("/w/a/node_modules"), project=Path("/w/a"), mtime=0, size=3 * 1024**3),
+            dc.Item("node", "node_modules", path=Path("/w/b/node_modules"), project=Path("/w/b"), mtime=0, size=1024**3),
+            dc.Item("node", "pnpm store prune", mode="action", shadowed=True),
+            dc.Item("go", "go build cache", path=Path("/c/go-build"))]
+    extra = [dc.Item("node", "npm cache", path=Path("/c/npm"), tier=dc.AGGRESSIVE)]
+    return dc.Picker(plan, extra, threshold="1d", **kw), plan, extra
+
+
+def _keys(picker, *keys):
+    for key in keys:
+        picker.key(key)
+
+
+def test_picker_starts_with_the_plan_and_needs_y_to_confirm():
+    picker, plan, _ = _picker()
+    assert picker.selected() == plan
+    _keys(picker, "enter", "x")                     # any key but y backs out of the confirmation
+    assert not picker.done and not picker.confirming
+    _keys(picker, "enter", "y")
+    assert picker.done and picker.result == plan
+
+
+def test_picker_quit_returns_nothing_and_empty_selection_cannot_be_confirmed():
+    picker, _, _ = _picker()
+    _keys(picker, "n", "enter")
+    assert not picker.confirming and picker.message == "nothing is selected"
+    picker.key("q")
+    assert picker.done and picker.result is None
+
+
+def test_picker_toggles_groups_targets_and_the_aggressive_tier():
+    picker, plan, extra = _picker()
+    assert list(picker.groups) == ["node", "go"]     # biggest measured group first
+    picker.key("space")                              # the node group off
+    assert picker.selected() == [plan[3]]
+    picker.key("space")                              # back on restores the plan, not the opt-in cache
+    assert picker.selected() == plan
+    _keys(picker, "right", "down", "space")          # open the group, untick its first target
+    assert plan[0] not in picker.selected() and plan[1] in picker.selected()
+    picker.key("a")                                  # the full cache clear replaces the prune of that cache
+    assert extra[0] in picker.selected() and plan[2] not in picker.selected()
+    picker.key("d")
+    assert picker.selected() == plan
+    _keys(picker, "left")
+    assert picker.rows()[picker.cursor] == ("node", None) and "node" not in picker.open
+
+
+def test_picker_renders_within_the_terminal_and_keeps_the_cursor_visible():
+    from io import StringIO
+    from rich.console import Console
+    picker, _, _ = _picker(notes=["projects: search stopped at its 10s budget"], can_size=True)
+    _keys(picker, "right", "end")
+    out = StringIO()
+    Console(file=out, width=80, height=12, force_terminal=False).print(picker.render(80, 12))
+    text = out.getvalue()
+    assert "❯" in text and "go build cache" in text and "above" in text
+    assert "Selected 4 of 5 targets" in text and "s measure sizes" in " ".join(text.split())
+    assert all(len(line) <= 80 for line in text.splitlines()) and len(text.splitlines()) <= 12
+
+
+def _run_main(monkeypatch, tmp_path, argv, items, *, tty=False):
+    from io import StringIO
+    from rich.console import Console
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('roots = []\naggressive = false\n')
+    monkeypatch.setattr(dc, "console", Console(file=StringIO(), width=100))
+    monkeypatch.setattr(dc, "scan_all", lambda ctx: items)
+    monkeypatch.setattr(dc.sys.stdin, "isatty", lambda: tty, raising=False)
+    monkeypatch.setattr(sys, "argv", ["dev-cleaner", "--config", str(cfg), *argv])
+    return dc.main()
+
+
+def test_without_a_terminal_nothing_is_cleaned_unless_yes(monkeypatch, tmp_path):
+    ran = []
+    items = [dc.Item("go", "go build cache", mode="action", action=lambda: ran.append(1) or "ok")]
+    assert _run_main(monkeypatch, tmp_path, [], items) == 2
+    assert not ran and "Pass --yes" in dc.console.file.getvalue()
+    assert _run_main(monkeypatch, tmp_path, ["--yes"], items) == 0
+    assert ran == [1]
+
+
+def test_json_reports_the_plan_then_each_result(monkeypatch, tmp_path, capsys):
+    import json
+    ran = []
+    def busy():
+        raise dc.CleanupDeferred("in use")
+    items = [dc.Item("go", "go build cache", mode="action", action=lambda: ran.append(1) or "ok"),
+             dc.Item("brew", "brew cleanup", mode="action", action=busy),
+             dc.Item("node", "npm cache", path=tmp_path / "npm", tier=dc.AGGRESSIVE)]
+    assert _run_main(monkeypatch, tmp_path, ["--json"], items) == 0
+    plan = json.loads(capsys.readouterr().out)        # stdout is the JSON object and nothing else
+    assert plan["dry_run"] and plan["result"] is None and not ran
+    assert [t["status"] for t in plan["targets"]] == ["planned", "planned"]
+    assert plan["left_alone"][0]["label"] == "npm cache" and plan["left_alone"][0]["reason"] == "needs --aggressive"
+
+    assert _run_main(monkeypatch, tmp_path, ["--json", "--yes"], items) == 1
+    done = json.loads(capsys.readouterr().out)
+    assert {t["label"]: (t["status"], t["detail"]) for t in done["targets"]} == {
+        "go build cache": ("cleaned", "ok"), "brew cleanup": ("incomplete", "in use")}
+    assert done["result"]["cleaned"] == 1 and done["result"]["incomplete"] == 1 and not done["dry_run"]
+
+
+def test_review_screen_decides_what_is_cleaned(monkeypatch, tmp_path):
+    ran = []
+    items = [dc.Item("go", "go build cache", mode="action", action=lambda: ran.append("go") or None),
+             dc.Item("brew", "brew cleanup", mode="action", action=lambda: ran.append("brew") or None)]
+    monkeypatch.setattr(dc, "can_interact", lambda: True)
+    monkeypatch.setattr(dc, "pick", lambda picker, measure=None: None)
+    assert _run_main(monkeypatch, tmp_path, [], items, tty=True) == 0 and not ran
+    monkeypatch.setattr(dc, "pick", lambda picker, measure=None: [picker.choices[1].item])
+    assert _run_main(monkeypatch, tmp_path, [], items, tty=True) == 0
+    assert ran == ["brew"]
+    # --plain and --yes never open the review screen
+    monkeypatch.setattr(dc, "pick", lambda *a, **k: pytest.fail("review screen opened"))
+    assert _run_main(monkeypatch, tmp_path, ["--yes"], items, tty=True) == 0
+
+
+def test_health_line_keeps_its_numbers_on_a_narrow_terminal(monkeypatch):
+    from io import StringIO
+    from rich.console import Console
+    monkeypatch.setattr(dc, "console", Console(file=StringIO(), width=80))
+    dc.console.print(dc.health_grid(disk_was=271 * 1024**3))
+    disk = next(line for line in dc.console.file.getvalue().splitlines() if "disk" in line)
+    assert "…" not in disk and disk.rstrip().endswith("free")

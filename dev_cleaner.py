@@ -386,7 +386,7 @@ _dev_cleaner() {{
     COMPREPLY=()
     cur="${{COMP_WORDS[COMP_CWORD]}}"
     prev="${{COMP_WORDS[COMP_CWORD-1]}}"
-    opts="--root --thorough --caches-only --verbose -v --days --hours --dry-run --yes --aggressive --gentle --only --skip --audit --docker-audit --mem --cpu --cpu-sample --top --filter --tree --full --mem-sort --mem-watch --list --dedupe --sizes --size-jobs --clean-jobs --command-timeout --config --init --show-config --completion -n -y -a -h --help"
+    opts="--root --thorough --caches-only --verbose -v --days --hours --dry-run --yes --plain --json --aggressive --gentle --only --skip --audit --docker-audit --mem --cpu --cpu-sample --top --filter --tree --full --mem-sort --mem-watch --list --dedupe --sizes --size-jobs --clean-jobs --command-timeout --config --init --show-config --completion -n -y -a -h --help"
     case "$prev" in
         --root|--config) COMPREPLY=( $(compgen -f -- "$cur") ); return ;;
         --completion) COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ); return ;;
@@ -411,6 +411,8 @@ _dev_cleaner() {{
         '(-y --yes)'{{-y,--yes}}'[Skip confirmation prompt]' \
         '(-a --aggressive)'{{-a,--aggressive}}'[Also clean dependency caches / unused images]' \
         '--gentle[Keep dependency caches even when the disk is tight]' \
+        '--plain[Print the plan and ask yes/no instead of the review screen]' \
+        '--json[Print the plan and results as JSON; never asks]' \
         '--only[Only run these groups]:groups:_values -s , group {_GROUPS_WS}' \
         '--skip[Skip these groups]:groups:_values -s , group {_GROUPS_WS}' \
         '--audit[Show the biggest dirs and how much of each would be freed]' \
@@ -449,6 +451,8 @@ complete -c dev-cleaner -s n -l dry-run -d "List candidates, do not clean"
 complete -c dev-cleaner -s y -l yes -d "Skip confirmation prompt"
 complete -c dev-cleaner -s a -l aggressive -d "Also clean dependency caches / unused images"
 complete -c dev-cleaner -l gentle -d "Keep dependency caches even when the disk is tight"
+complete -c dev-cleaner -l plain -d "Print the plan and ask yes/no instead of the review screen"
+complete -c dev-cleaner -l json -d "Print the plan and results as JSON; never asks"
 complete -c dev-cleaner -l only -d "Only run these groups" -x -a "{_GROUPS_WS}"
 complete -c dev-cleaner -l skip -d "Skip these groups" -x -a "{_GROUPS_WS}"
 complete -c dev-cleaner -l audit -d "Show the biggest dirs and how much of each would be freed"
@@ -2707,10 +2711,12 @@ def health_rows(disk_was: int | None = None) -> list[tuple[str, Text]]:
     if u is not None and u.total:
         pct = u.used / u.total
         color = "red bold" if u.free < 20 * 1024**3 or pct > 0.9 else "yellow" if pct > 0.8 else "green"
-        line = Text.assemble((f"{human_size(u.free)} free", color), (f" of {human_size(u.total)}  ", "dim"),
-                             _bar(pct, color.split()[0]), (f"  {pct * 100:.0f}% used", "dim"))
-        if disk_was is not None:
-            line.append(f"  was {human_size(disk_was)} free", style="dim")
+        head = Text.assemble((f"{human_size(u.free)} free", color), (f" of {human_size(u.total)}  ", "dim"))
+        tail = Text(f"  {pct * 100:.0f}% used" + (f"  was {human_size(disk_was)} free" if disk_was is not None else ""),
+                    style="dim")
+        # The bar is the part that gives way on a narrow terminal, never the numbers.
+        room = console.width - 10 - head.cell_len - tail.cell_len
+        line = Text.assemble(head, _bar(pct, color.split()[0], width=max(6, min(24, room))), tail)
         rows.append(("disk", line))
     mem = system_memory()
     if "RAM" in mem:
@@ -3249,6 +3255,7 @@ class CleanupReport:
     cleaned: int = 0
     deferred: int = 0
     failed: int = 0
+    outcomes: dict[int, tuple[str, str | None]] = field(default_factory=dict, compare=False, repr=False)  # id(item) -> (status, detail)
 
 
 def _delete(item: Item, roots: list[Path], cancelled: Event | None = None
@@ -3285,9 +3292,14 @@ def clean_all(items: list[Item], workers: int, roots: list[Path], *, verbose: bo
     def render():
         completed = result.cleaned + result.deferred + result.failed
         freed = max(0, shutil.disk_usage(HOME).free - free_before)
-        heading = Text(f"Freed {human_size(freed)}  ·  Cleaning {completed}/{len(items)}  ·  {result.cleaned} done  ·  "
-                       f"{result.deferred} incomplete  ·  {result.failed} failed  ·  "
-                       f"{_elapsed(time.monotonic() - started)}", style="bold", no_wrap=True, overflow="ellipsis")
+        heading = Text.assemble(
+            ("Cleaning  ", "bold"), _bar(completed / max(1, len(items)), "green"),
+            (f"  {completed}/{len(items)}", "bold"), ("  freed ", "dim"), (human_size(freed), "bold green"),
+            (f"  {_elapsed(time.monotonic() - started)}", "dim"), no_wrap=True, overflow="ellipsis")
+        if result.deferred:
+            heading.append(f"  {result.deferred} incomplete", style="yellow")
+        if result.failed:
+            heading.append(f"  {result.failed} failed", style="red")
         table = _status_table()
         styles = {"running": "cyan", "done": "green", "incomplete": "yellow", "failed": "red", "waiting": "dim"}
         for state, label, began, ended in slots:
@@ -3385,7 +3397,284 @@ def clean_all(items: list[Item], workers: int, roots: list[Path], *, verbose: bo
         rows.append((mark, item.group, what))
     if rows:
         console.print(_grid(rows, styles=("", "bold")))
+    for key, (_, note, error) in outcomes.items():
+        result.outcomes[key] = (("cleaned", note) if error is None else
+                                ("incomplete" if isinstance(error, CleanupDeferred) else "failed", str(error)))
     return result
+
+
+# ---------------------------------------------------------------------------
+# Interactive review
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Choice:
+    item: Item
+    on: bool
+    default: bool                    # False for targets the plan leaves alone until asked
+
+
+_KEYS = {b"[A": "up", b"[B": "down", b"[C": "right", b"[D": "left", b"OA": "up", b"OB": "down", b"OC": "right",
+         b"OD": "left", b"[5~": "pgup", b"[6~": "pgdn", b"[H": "home", b"[F": "end", b"[1~": "home", b"[4~": "end"}
+_KEY_ALIASES = {"k": "up", "j": "down", "l": "right", "h": "left", "\t": "right", " ": "space", "\r": "enter",
+                "\n": "enter", "g": "home", "G": "end", "\x04": "q", "\x02": "pgup", "\x06": "pgdn"}
+
+
+def read_key(fd: int, timeout: float = 0.5) -> str:
+    """One keypress as a name; "" when nothing arrived, so the caller can redraw after a resize."""
+    import select
+    if not select.select([fd], [], [], timeout)[0]:
+        return ""
+    ch = os.read(fd, 1)
+    if not ch:
+        return "q"                   # stdin closed under us
+    if ch == b"\x1b":
+        if not select.select([fd], [], [], 0.05)[0]:
+            return "esc"
+        return _KEYS.get(os.read(fd, 8), "")
+    key = ch.decode("utf-8", "ignore")
+    return _KEY_ALIASES.get(key, key)
+
+
+class Picker:
+    """What the review screen holds: groups that fold open into targets, and which of them are ticked."""
+
+    HELP = "↑↓ move · space toggle · →← open/close · a aggressive tier · n none · d reset · enter clean · q quit"
+
+    def __init__(self, to_clean: list[Item], extra: list[Item], *, threshold: str, notes: list[str] = (),
+                 headline: str = "", can_size: bool = False):
+        self.choices = [Choice(i, True, True) for i in to_clean] + [Choice(i, False, False) for i in extra]
+        self.threshold, self.notes, self.headline, self.can_size = threshold, list(notes), headline, can_size
+        self.open: set[str] = set()
+        self.cursor = self.top = 0
+        self.confirming = self.done = self.want_sizes = False
+        self.message = ""
+        self.result: list[Item] | None = None
+        rows = health_rows()         # read once: a keypress must not shell out for memory counters
+        self.health, self.health_lines = _grid(rows, styles=("dim",), wrap_last=False), len(rows)
+        self.regroup()
+
+    def regroup(self) -> None:
+        groups: dict[str, list[Choice]] = defaultdict(list)
+        for choice in self.choices:
+            groups[choice.item.group].append(choice)
+        for members in groups.values():
+            members.sort(key=lambda c: (not c.default, -(c.item.size if c.item.size is not None else -1)))
+        order = {g: n for n, g in enumerate(ALL_GROUPS)}
+        self.groups = dict(sorted(groups.items(), key=lambda kv: (
+            -sum(c.item.size or 0 for c in kv[1] if c.default and not c.item.ram), order.get(kv[0], 99))))
+
+    def rows(self) -> list[tuple[str, Choice | None]]:
+        out: list[tuple[str, Choice | None]] = []
+        for group, members in self.groups.items():
+            out.append((group, None))
+            if group in self.open:
+                out += [(group, c) for c in members]
+        return out
+
+    def selected(self) -> list[Item]:
+        chosen = [c.item for c in self.choices if c.on]
+        # A full cache clear makes the prune of that same cache redundant.
+        cleared = {i.group for i in chosen if i.tier == AGGRESSIVE}
+        return [i for i in chosen if not (i.shadowed and i.group in cleared)]
+
+    def key(self, key: str) -> None:
+        if not key:
+            return
+        self.message = ""
+        if self.confirming:
+            self.confirming = False
+            if key == "y":
+                self.result, self.done = self.selected(), True
+            return
+        rows = self.rows()
+        group, choice = rows[self.cursor]
+        members = self.groups[group]
+        if key in ("up", "down", "pgup", "pgdn", "home", "end"):
+            step = {"up": -1, "down": 1, "pgup": -10, "pgdn": 10, "home": -len(rows), "end": len(rows)}[key]
+            self.cursor = min(len(rows) - 1, max(0, self.cursor + step))
+        elif key == "space":
+            if choice is not None:
+                choice.on = not choice.on
+            elif any(c.on for c in members):
+                for c in members:
+                    c.on = False
+            else:  # back on means back to the plan; a group that is all opt-in has nothing else to offer
+                for c in members:
+                    c.on = c.default or not any(m.default for m in members)
+        elif key == "right" and choice is None:
+            self.open.add(group)
+        elif key == "left":
+            self.open.discard(group)
+            self.cursor = self.rows().index((group, None))
+        elif key == "a":
+            extras = [c for c in self.choices if not c.default]
+            turn_on = not all(c.on for c in extras)
+            for c in extras:
+                c.on = turn_on
+            if not extras:
+                self.message = "nothing more to add: the aggressive tier is already in the plan"
+        elif key == "n":
+            for c in self.choices:
+                c.on = False
+        elif key == "d":
+            for c in self.choices:
+                c.on = c.default
+        elif key == "s" and self.can_size:
+            self.want_sizes = True
+        elif key == "enter":
+            if self.selected():
+                self.confirming = True
+            else:
+                self.message = "nothing is selected"
+        elif key in ("q", "esc"):
+            self.done = True
+
+    def _tally(self, choices: list[Choice]) -> Text:
+        if choices and all(c.item.ram for c in choices):
+            return Text(human_size(sum(c.item.size or 0 for c in choices if c.on)) + " RAM", style="cyan")
+        disk = [c.item for c in choices if c.on and not c.item.ram]
+        if not any(i.size is not None for i in disk):
+            return Text("—", style="dim")
+        known = sum(i.size or 0 for i in disk)
+        return Text(human_size(known) + ("+" if any(i.size is None for i in disk) else ""), style=size_color(known))
+
+    def render(self, width: int, height: int) -> Group:
+        rows = self.rows()
+        roomy = height >= 20         # a short terminal keeps the list and drops the context around it
+        notes = self.notes[:3] if roomy else []
+        help_line = self.HELP + (" · s measure sizes" if self.can_size else "")
+        fixed = (6 + (len(help_line) - 1) // max(20, width) + (self.health_lines + 1 if roomy else 0)
+                 + (len(notes) + 1 if notes else 0))
+        room = max(3, height - fixed)
+        self.top = min(max(0, len(rows) - room), max(0, min(self.top, self.cursor)))
+        if self.cursor >= self.top + room:
+            self.top = self.cursor - room + 1
+        grid = Table.grid(padding=(0, 1), expand=True)
+        for kw in (dict(width=1), dict(width=1), dict(width=3), dict(min_width=max(len(g) for g in self.groups)),
+                   dict(justify="right", min_width=5), dict(justify="right", min_width=9)):
+            grid.add_column(no_wrap=True, **kw)
+        grid.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+        now = time.time()
+        for n, (group, choice) in enumerate(rows[self.top:self.top + room], start=self.top):
+            here = n == self.cursor
+            pointer = Text("❯" if here else "", style="cyan bold")
+            if choice is None:
+                members = self.groups[group]
+                on = sum(c.on for c in members)
+                box = Text("[x]", style="green") if on == len(members) else Text(
+                    "[-]", style="yellow") if on else Text("[ ]", style="dim")
+                labels = list(dict.fromkeys(c.item.label for c in members if c.default or c.on)) or \
+                    list(dict.fromkeys(c.item.label for c in members))
+                detail = Text(", ".join(labels[:4]) + (f", +{len(labels) - 4} more" if len(labels) > 4 else ""), style="dim")
+                off = sum(1 for c in members if not c.default and not c.on)
+                if off:
+                    detail.append(f"  +{off} aggressive, off", style="red dim")
+                count = Text(f"{on}/{len(members)}" if on != len(members) else str(on), style="dim")
+                grid.add_row(pointer, Text("▾" if group in self.open else "▸", style="dim"), box,
+                             Text(group, style="bold"), count, self._tally(members), detail,
+                             style="on grey19" if here else "")
+                continue
+            item = choice.item
+            box = Text("[x]", style="green") if choice.on else Text("[ ]", style="dim")
+            age = Text("")
+            if item.mtime is not None and item.mtime != float("inf"):
+                days = (now - item.mtime) / 86400
+                age = Text(f"{days:.0f}d" if days >= 10 else f"{days:.1f}d" if days >= 1 else f"{days * 24:.0f}h",
+                           style=age_color(days))
+            size = Text(human_size(item.size) + (" RAM" if item.ram else ""),
+                        style="cyan" if item.ram else size_color(item.size)) if item.size is not None else Text("—", style="dim")
+            what = Text()
+            if item.is_project:
+                what.append(tilde(item.project)).append("  " + item.label, style="dim")
+            else:
+                what.append(item.label)
+                if item.path:
+                    what.append("  " + tilde(item.path), style="dim")
+                if item.note:
+                    what.append("  " + item.note, style="dim italic")
+            if item.tier == AGGRESSIVE:
+                what.append("  aggressive", style="red dim")
+            grid.add_row(pointer, "", box, "", age, size, what, style="on grey19" if here else "")
+        chosen = self.selected()
+        below = len(rows) - self.top - room
+        scroll = " · ".join(([f"↑ {self.top} above"] if self.top else []) + ([f"↓ {below} below"] if below > 0 else []))
+        total = Text.assemble(("Selected ", "bold"), (f"{len(chosen)} of {len(self.choices)} targets", ""),
+                              ("  frees ", "dim"), self._tally(self.choices))
+        ram = sum(i.size or 0 for i in chosen if i.ram)
+        if ram:
+            total.append(f" and {human_size(ram)} RAM", style="cyan")
+        if self.confirming:
+            foot = Text.assemble((f"Clean these {len(chosen)} targets? ", "bold"), ("y", "bold green"),
+                                 (" cleans · any other key goes back", "dim"))
+        elif self.message:
+            foot = Text(self.message, style="yellow")
+        else:
+            foot = Text(help_line, style="dim")
+        parts: list = [Text.assemble(("dev-cleaner", "bold"), ("  review", "dim")),
+                       *([self.health, Text("")] if roomy else []),
+                       _section("Will clean", f"project builds idle over {self.threshold}"
+                                + (f" · {self.headline}" if self.headline else "")),
+                       Padding(grid, (0, 0, 0, 1)), Text("  " + scroll, style="dim"), total]
+        if notes:
+            parts.append(Text(""))
+            parts += [Text("  " + n.replace("\n", " "), style="dim", no_wrap=True, overflow="ellipsis") for n in notes]
+        return Group(*parts, Text(""), foot)
+
+
+def can_interact() -> bool:
+    """A person is at the keyboard and the terminal can redraw."""
+    if not (sys.stdin.isatty() and console.is_terminal) or os.environ.get("TERM") in (None, "", "dumb"):
+        return False
+    try:
+        import termios  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def pick(picker: Picker, measure: Callable[[], None] | None = None) -> list[Item] | None:
+    """Run the review screen until the user confirms a selection (returned) or quits (None)."""
+    import termios
+    import tty
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        with Live(console=console, screen=True, auto_refresh=False) as live:
+            drawn = None
+            while not picker.done:
+                if drawn != console.size:    # first pass, a keypress or a resize: an idle screen is left alone
+                    drawn = console.size
+                    live.update(picker.render(*drawn), refresh=True)
+                key = read_key(fd)
+                if key:
+                    picker.key(key)
+                    drawn = None
+                if picker.want_sizes and measure is not None:
+                    live.stop()
+                    termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+                    measure()
+                    picker.want_sizes, picker.can_size = False, False
+                    picker.regroup()
+                    picker.cursor = picker.top = 0
+                    tty.setcbreak(fd)
+                    live.start()
+                    drawn = None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+    return picker.result
+
+
+def item_json(item: Item, now: float) -> dict:
+    return {"group": item.group, "label": item.label,
+            "path": str(item.path) if item.path is not None else None,
+            "project": str(item.project) if item.project is not None else None,
+            "bytes": item.size, "frees": "memory" if item.ram else "disk", "tier": item.tier,
+            "idle_days": round((now - item.mtime) / 86400, 2)
+            if item.mtime is not None and item.mtime != float("inf") else None,
+            "note": item.note or None}
 
 
 # ---------------------------------------------------------------------------
@@ -3519,7 +3808,12 @@ def main() -> int:
     age.add_argument("--days", type=float, default=None, help="Project idle age in days (default 1)")
     age.add_argument("--hours", type=float, default=None, help="Project idle age in hours")
     p.add_argument("-n", "--dry-run", action="store_true", help="List what would be cleaned, change nothing")
-    p.add_argument("-y", "--yes", action="store_true", help="Skip the confirmation prompt")
+    p.add_argument("-y", "--yes", action="store_true", help="Clean without asking; the way to run unattended")
+    out = p.add_mutually_exclusive_group()
+    out.add_argument("--plain", action="store_true",
+                     help="No review screen: print the plan and ask a yes/no question")
+    out.add_argument("--json", action="store_true",
+                     help="Print the plan (and with --yes, each result) as one JSON object on stdout; never asks")
     tier = p.add_mutually_exclusive_group()
     tier.add_argument("-a", "--aggressive", action="store_true",
                       help="Also clean dependency download caches and all unused docker images "
@@ -3563,6 +3857,9 @@ def main() -> int:
     args = p.parse_args()
     if args.audit and args.caches_only:
         p.error("--audit cannot be combined with --caches-only")
+    if args.json and any((args.audit, args.docker_audit, args.mem, args.cpu, args.dedupe, args.init, args.list,
+                          args.show_config, args.completion)):
+        p.error("--json describes a cleanup run; it cannot be combined with a report or setup flag")
     if not (args.mem or args.cpu) and any((args.mem_top is not None, args.mem_filter is not None,
                                            args.mem_tree, args.mem_full)):
         p.error("--top, --filter, --tree and --full require --mem or --cpu")
@@ -3585,6 +3882,8 @@ def main() -> int:
         console.print(render_groups_table())
         return 0
 
+    if args.json:
+        console.file = sys.stderr    # stdout carries the JSON object and nothing else
     if console.width > MAX_WIDTH and not args.mem_full:
         console.width = MAX_WIDTH
     console.print(banner())
@@ -3753,35 +4052,80 @@ def main() -> int:
         console.print("\n[dim]audit — no changes made.[/]\n")
         return 0
 
-    if not to_clean:
+    def emit(dry_run: bool, result: CleanupReport | None = None, freed: int = 0, seconds: float = 0.0) -> None:
+        targets = []
+        for item in to_clean:
+            status, detail = (result.outcomes.get(id(item), ("skipped", None)) if result else ("planned", None))
+            targets.append({**item_json(item, now), "status": status, "detail": detail})
+        usage = shutil.disk_usage(HOME)
+        print(json.dumps({
+            "dry_run": dry_run, "tier": AGGRESSIVE if aggressive else SAFE, "disk_pressure": level,
+            "idle_hours": age_hours, "disk": {"free_bytes": usage.free, "total_bytes": usage.total},
+            "targets": targets,
+            "left_alone": [{**item_json(i, now), "reason": "needs --aggressive"} for i in extra]
+                          + [{**item_json(i, now), "reason": "recently active"} for i in active],
+            "warnings": ctx.warnings,
+            "result": None if result is None else {
+                "cleaned": result.cleaned, "incomplete": result.deferred, "failed": result.failed,
+                "freed_bytes": freed, "seconds": round(seconds, 1)},
+        }, indent=2))
+
+    interactive = not (args.yes or args.dry_run or args.plain or args.json) and can_interact()
+    if not to_clean and not (interactive and extra):
         console.print("\n[bold]No cleanup candidates found in this scan.[/]")
         for n in notes:
             console.print()
             console.print(n)
         console.print()
+        if args.json:
+            emit(dry_run=not args.yes)
         return 0
 
-    console.print()
-    if mode_note:
-        console.print(Text.assemble(("Disk is " + level, "red bold" if level == "critical" else "yellow"),
-                                    ("  " + mode_note + " · --gentle opts out", "dim")))
+    if interactive:
+        def measure() -> None:
+            with make_progress() as progress:
+                size_items(to_clean + extra, size_jobs, progress)
+            ctx.measure_sizes = True
+
+        headline = ("disk is " + level + ", aggressive tier included" if auto else "aggressive tier included" if aggressive else "")
+        chosen = pick(Picker(to_clean, extra, threshold=threshold, notes=ctx.warnings, headline=headline,
+                             can_size=not ctx.measure_sizes), measure)
+        if chosen is None:
+            console.print("\n[yellow]Nothing cleaned.[/]\n")
+            return 0
+        to_clean = chosen
+        aggressive = aggressive or any(i.tier == AGGRESSIVE for i in to_clean)
         console.print()
-    console.print((render_table if args.verbose else render_summary)(to_clean, threshold, aggressive))
-    for n in notes:
+        console.print((render_table if args.verbose else render_summary)(to_clean, threshold, aggressive))
+    else:
         console.print()
-        console.print(n)
-    more = ([] if args.verbose else ["--verbose lists every path"]) + (
-        [] if ctx.measure_sizes else ["--sizes measures before cleaning"]) + ["--audit shows where the disk went"]
-    console.print()
-    console.print(Text("  " + " · ".join(more), style="dim"))
+        if mode_note:
+            console.print(Text.assemble(("Disk is " + level, "red bold" if level == "critical" else "yellow"),
+                                        ("  " + mode_note + " · --gentle opts out", "dim")))
+            console.print()
+        console.print((render_table if args.verbose else render_summary)(to_clean, threshold, aggressive))
+        for n in notes:
+            console.print()
+            console.print(n)
+        more = ([] if args.verbose else ["--verbose lists every path"]) + (
+            [] if ctx.measure_sizes else ["--sizes measures before cleaning"]) + ["--audit shows where the disk went"]
+        console.print()
+        console.print(Text("  " + " · ".join(more), style="dim"))
 
-    if args.dry_run:
-        console.print("\n[dim]dry-run — no changes made.[/]\n")
-        return 0
+        if args.dry_run or (args.json and not args.yes):
+            console.print("\n[dim]dry-run — no changes made.[/]\n")
+            if args.json:
+                emit(dry_run=True)
+            return 0
 
-    if not args.yes and not Confirm.ask(f"\n[bold]Clean these {len(to_clean)} targets?[/]", default=False):
-        console.print("[yellow]aborted.[/]")
-        return 0
+        if not args.yes:
+            if not sys.stdin.isatty():
+                console.print("\n[yellow]Nothing cleaned:[/] no terminal to confirm on. "
+                              "Pass [bold]--yes[/] to clean or [bold]--dry-run[/] to preview.\n")
+                return 2
+            if not Confirm.ask(f"\n[bold]Clean these {len(to_clean)} targets?[/]", default=False):
+                console.print("[yellow]aborted.[/]")
+                return 0
 
     free_before = shutil.disk_usage(HOME).free
     started = time.monotonic()
@@ -3789,6 +4133,8 @@ def main() -> int:
     result = clean_all(to_clean, clean_jobs, roots, verbose=args.verbose)
     usage = shutil.disk_usage(HOME)
     freed = max(0, usage.free - free_before)
+    if args.json:
+        emit(dry_run=False, result=result, freed=freed, seconds=time.monotonic() - started)
 
     est = sum(i.size or 0 for i in to_clean if not i.ram)
     head = Text.assemble(("Freed ", "bold"), (human_size(freed), "bold green"),

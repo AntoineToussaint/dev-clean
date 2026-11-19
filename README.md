@@ -68,8 +68,10 @@ The installer:
 ```bash
 dev-cleaner --dry-run          # show what would be cleaned (no changes)
 dev-cleaner --dry-run --sizes  # also measure byte counts (slower)
-dev-cleaner                    # scan disk, memory and CPU; list; prompt; clean
-dev-cleaner --yes              # skip the confirmation prompt
+dev-cleaner                    # scan disk, memory and CPU, then review and pick what to clean
+dev-cleaner --yes              # clean the plan without asking (cron, scripts, agents)
+dev-cleaner --json --yes       # the same, with the plan and each result as JSON on stdout
+dev-cleaner --plain            # no review screen: print the plan, ask yes/no
 dev-cleaner --aggressive       # also wipe dependency download caches + all unused docker images
 dev-cleaner --only rust,docker # restrict to some groups
 dev-cleaner --skip brew        # run everything except some groups
@@ -84,6 +86,41 @@ dev-cleaner --mem --mem-watch 5 --mem-sort growth # watch which processes keep g
 dev-cleaner --cpu              # what is burning CPU right now, and what has been for hours
 dev-cleaner --docker-audit     # Docker disk, container memory and individual buildx caches
 ```
+
+### Review screen
+
+On a terminal, a run ends in a review screen instead of a yes/no question:
+
+```
+Will clean  project builds idle over 1d
+   ▾ [-] node     6/8  11.5 GB+ node_modules, pnpm store prune  +1 aggressive, off
+     [x]         1.5d    3.4 GB ~/dev/app0  node_modules
+ ❯   [ ]         2.5d    3.0 GB ~/dev/app1  node_modules
+     [ ]                11.2 GB npm cache  ~/.npm  aggressive
+   ▸ [x] go         1    6.5 GB go build cache
+   ▸ [-] docker   1/2         — docker system prune  +1 aggressive, off
+
+Selected 9 of 12 targets  frees 18.1 GB+ and 2.8 GB RAM
+```
+
+| Key | Does |
+|---|---|
+| `↑` `↓` (`j` `k`), PgUp/PgDn | Move. |
+| `space` | Tick or untick the group or target under the cursor. |
+| `→` `←` | Open or close a group to see its targets. |
+| `a` | Add or drop the aggressive tier (dependency caches, unused images). |
+| `n`, `d` | Untick everything; return to the plan. |
+| `s` | Measure sizes, when the run did not use `--sizes`. |
+| `enter`, then `y` | Clean the ticked targets. |
+| `q` | Leave without cleaning. |
+
+### Unattended runs
+
+`--yes` cleans the plan without asking and `--dry-run` only prints it; neither opens the review screen. Without a terminal on stdin and without `--yes`, nothing is cleaned and the exit code is 2.
+
+`--json` writes one JSON object to stdout and sends the human-readable output to stderr. Alone it is a preview (`"dry_run": true`); with `--yes` it cleans and adds a `status` (`cleaned`, `incomplete`, `failed`) to every target and a `result` with the counts and `freed_bytes`.
+
+Exit codes: 0 when everything selected was cleaned or nothing needed cleaning, 1 when a cleanup was incomplete or failed, 2 for a usage error or a run that had no way to confirm.
 
 ### Where did my disk go?
 
@@ -341,7 +378,9 @@ dev-cleaner --completion fish > ~/.config/fish/completions/dev-cleaner.fish
 | `--days N` | `1.0` | Project idle age in days. |
 | `--hours N` | | Project idle age in hours (mutually exclusive with `--days`). |
 | `-n`, `--dry-run` | off | List candidates, don't clean. |
-| `-y`, `--yes` | off | Skip the y/N prompt. |
+| `-y`, `--yes` | off | Clean without asking. No review screen. |
+| `--plain` | off | Print the plan and ask yes/no instead of opening the review screen. |
+| `--json` | off | Plan and results as one JSON object on stdout; never asks. Cleans only with `--yes`. |
 | `-a`, `--aggressive` | auto | Also clean dependency download caches and all unused docker images. On by itself once under 15% of the disk is free. |
 | `--dedupe` | off | Share identical files across `--root` dirs via copy-on-write clones. Removes nothing. |
 | `--gentle` | off | Keep dependency caches and the configured idle age even when the disk is tight. |
