@@ -13,8 +13,10 @@ Homebrew, Xcode DerivedData, cargo/npm/uv/pip/gradle caches, ...) and idle temp 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import errno
 import fnmatch
+import hashlib
 import json
 import math
 import os
@@ -31,14 +33,14 @@ from collections import defaultdict, deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from threading import Event, local
+from threading import Event, get_ident, local
 from typing import Callable
 
-from rich.box import ROUNDED
+from rich.box import SIMPLE_HEAD
 from rich.console import Console, Group
 from rich.live import Live
 from rich.markup import escape
-from rich.panel import Panel
+from rich.padding import Padding
 from rich.progress import (
     Progress,
     SpinnerColumn,
@@ -49,6 +51,8 @@ from rich.table import Table
 from rich.text import Text
 
 console = Console()
+MAX_WIDTH = 110                    # wider terminals only stretch tables into unreadable rows
+TABLE = dict(box=SIMPLE_HEAD, header_style="dim", title_style="bold", border_style="dim")
 
 HOME = Path.home()
 IS_MAC = sys.platform == "darwin"
@@ -176,13 +180,6 @@ PROJECT_GROUPS = tuple(dict.fromkeys(r.group for r in RULES))
 GLOBAL_GROUPS = ("go", "docker", "brew", "xcode", "tools", "tmp", "extra", "procs")
 ALL_GROUPS = tuple(dict.fromkeys(PROJECT_GROUPS + GLOBAL_GROUPS))
 
-GROUP_EMOJI = {
-    "rust": "🦀", "node": "📦", "python": "🐍", "jvm": "☕", "swift": "🕊️", "elixir": "💧",
-    "zig": "⚡", "ocaml": "🐫", "haskell": "λ", "dart": "🎯", "cmake": "🔧", "dotnet": "🟣",
-    "terraform": "🏗️", "php": "🐘", "go": "🐹", "docker": "🐳", "brew": "🍺", "xcode": "🍎",
-    "tools": "🧰", "tmp": "🗑️", "extra": "📁", "procs": "🧟",
-}
-
 # Global cache dirs that belong to no project. (label, group, tier, note, candidate paths)
 KNOWN_CACHES: tuple[tuple[str, str, str, str, tuple[Path, ...]], ...] = (
     ("sccache", "rust", SAFE, "compiler cache; rebuilt on demand",
@@ -244,16 +241,33 @@ DEFAULTS: dict = {
     "roots": ["~"],
     "ignore": [],
     "days": 1.0,
-    "aggressive": False,
+    "aggressive": "auto",          # "auto" follows free disk space; true / false pin it
     "skip": [],
     "size_jobs": 16,
     "clean_jobs": 4,
     "command_timeout": 60,
+    "scan_seconds": SCAN_SECONDS,
+    "dedupe": {"paths": [], "min_kb": 16},
     "docker": {"volumes": False},
     "tmp": {"claude_scratch": True},
     "extra": [],
     "procs": {"orphan_dirs": []},
 }
+
+
+TIGHT_FREE = 0.15                  # under this share of the disk free: dependency caches go too
+CRITICAL_FREE = 0.05               # under this: the idle age is cut as well
+CRITICAL_HOURS = 6.0
+
+
+def disk_pressure(path: Path | None = None) -> tuple[str, int, int]:
+    """("ok" | "tight" | "critical", free bytes, total bytes) for the disk holding the home dir."""
+    try:
+        u = shutil.disk_usage(path or HOME)
+    except OSError:
+        return "ok", 0, 0
+    share = u.free / u.total if u.total else 1.0
+    return ("critical" if share < CRITICAL_FREE else "tight" if share < TIGHT_FREE else "ok"), u.free, u.total
 
 
 def config_path() -> Path:
@@ -267,7 +281,7 @@ def legacy_config_path() -> Path:
 
 
 def render_config(roots: list[str], days: float, ignore: list[str] | None = None,
-                  aggressive: bool = False, skip: list[str] | None = None,
+                  aggressive: bool | str = "auto", skip: list[str] | None = None,
                   docker_volumes: bool | str = False) -> str:
     """Serialize a config as TOML with comments."""
     ignore = ignore or []
@@ -286,9 +300,11 @@ ignore = {ignore!r}
 # this many days.
 days = {days}
 
-# Also clean dependency download caches (cargo registry, go modcache, npm/pip,
-# gradle, ...) and all unused docker images. Same as --aggressive.
-aggressive = {str(aggressive).lower()}
+# Dependency download caches (cargo registry, go modcache, npm/pip, gradle,
+# .terraform, ...) and all unused docker images. "auto" includes them once less
+# than 15% of the disk is free, and under 5% also cuts the idle age to 6 hours.
+# true always includes them (--aggressive); false never does (--gentle).
+aggressive = {'"auto"' if aggressive == "auto" else str(bool(aggressive)).lower()}
 
 # Cleaner groups to never run. See `dev-cleaner --list`.
 skip = {skip!r}
@@ -370,7 +386,7 @@ _dev_cleaner() {{
     COMPREPLY=()
     cur="${{COMP_WORDS[COMP_CWORD]}}"
     prev="${{COMP_WORDS[COMP_CWORD-1]}}"
-    opts="--root --thorough --caches-only --verbose -v --days --hours --dry-run --yes --aggressive --only --skip --audit --docker-audit --mem --cpu --cpu-sample --top --filter --tree --full --mem-sort --mem-watch --list --sizes --size-jobs --clean-jobs --command-timeout --config --init --show-config --completion -n -y -a -h --help"
+    opts="--root --thorough --caches-only --verbose -v --days --hours --dry-run --yes --aggressive --gentle --only --skip --audit --docker-audit --mem --cpu --cpu-sample --top --filter --tree --full --mem-sort --mem-watch --list --dedupe --sizes --size-jobs --clean-jobs --command-timeout --config --init --show-config --completion -n -y -a -h --help"
     case "$prev" in
         --root|--config) COMPREPLY=( $(compgen -f -- "$cur") ); return ;;
         --completion) COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ); return ;;
@@ -394,6 +410,7 @@ _dev_cleaner() {{
         '(-n --dry-run)'{{-n,--dry-run}}'[List candidates, do not clean]' \
         '(-y --yes)'{{-y,--yes}}'[Skip confirmation prompt]' \
         '(-a --aggressive)'{{-a,--aggressive}}'[Also clean dependency caches / unused images]' \
+        '--gentle[Keep dependency caches even when the disk is tight]' \
         '--only[Only run these groups]:groups:_values -s , group {_GROUPS_WS}' \
         '--skip[Skip these groups]:groups:_values -s , group {_GROUPS_WS}' \
         '--audit[Show the biggest dirs and how much of each would be freed]' \
@@ -431,6 +448,7 @@ complete -c dev-cleaner -l hours -d "Min idle age in hours" -x
 complete -c dev-cleaner -s n -l dry-run -d "List candidates, do not clean"
 complete -c dev-cleaner -s y -l yes -d "Skip confirmation prompt"
 complete -c dev-cleaner -s a -l aggressive -d "Also clean dependency caches / unused images"
+complete -c dev-cleaner -l gentle -d "Keep dependency caches even when the disk is tight"
 complete -c dev-cleaner -l only -d "Only run these groups" -x -a "{_GROUPS_WS}"
 complete -c dev-cleaner -l skip -d "Skip these groups" -x -a "{_GROUPS_WS}"
 complete -c dev-cleaner -l audit -d "Show the biggest dirs and how much of each would be freed"
@@ -449,6 +467,7 @@ complete -c dev-cleaner -l thorough -d "Search all projects without a scan budge
 complete -c dev-cleaner -l caches-only -d "Skip project discovery"
 complete -c dev-cleaner -s v -l verbose -d "Show every path and result"
 complete -c dev-cleaner -l sizes -d "Measure directory and Docker cache sizes (slower)"
+complete -c dev-cleaner -l dedupe -d "Share identical files across checkouts (APFS clones)"
 complete -c dev-cleaner -l size-jobs -d "Parallel sizing workers" -x
 complete -c dev-cleaner -l clean-jobs -d "Parallel cleanup workers" -x
 complete -c dev-cleaner -l command-timeout -d "Cleanup command time limit in seconds" -x
@@ -621,6 +640,10 @@ def force_rmtree(path: Path) -> None:
 
 class CleanupDeferred(RuntimeError):
     """Partial or unverified cleanup: do not retry a busy backend during this run."""
+
+
+class CleanupPartial(CleanupDeferred):
+    """Some entries of one sweep stayed behind. Other sweeps are independent and still run."""
 
 
 _cleanup_thread = local()
@@ -847,8 +870,8 @@ def scan_projects(ctx: Context, progress: Progress) -> list[Item]:
         progress.remove_task(task)
 
     if discovery_deadline is not None and time.monotonic() >= discovery_deadline:
-        ctx.warnings.append("Project search reached its time budget; deeper projects were not scanned. "
-                            "Use --root PATH to focus it or --thorough for a full scan.")
+        ctx.warnings.append(f"projects: search stopped at its {ctx.scan_seconds:g}s budget, deeper projects were not seen. "
+                            "--thorough searches everything, --root PATH narrows it")
 
     if not found:
         return []
@@ -879,13 +902,20 @@ def scan_projects(ctx: Context, progress: Progress) -> list[Item]:
     progress.remove_task(task)
     unchecked = sum(m == float("inf") for m in activity.values())
     if unchecked:
-        ctx.warnings.append(f"Kept {unchecked} project(s) with incomplete activity checks (time budget or unreadable files).")
+        ctx.warnings.append(f"projects: kept {unchecked} project(s) with incomplete activity checks (time budget or unreadable files).")
 
+    # Source mtimes cannot see a dev server or agent still running out of an old checkout.
+    busy = live_cwds()
+    in_use = {t for t in activity if t.resolve() in busy}
+    if in_use:
+        ctx.warnings.append(f"projects: kept {len(in_use)} idle-looking project(s) that a running process is working in")
+    now = time.time()
     items = []
     for group, project, build, bd in found:
         items.append(Item(
             group=group, label=bd.name + "/", path=build, tier=bd.tier,
-            mtime=activity[top_of[project]], note=bd.note, mode="rmtree", project=project,
+            mtime=now if top_of[project] in in_use else activity[top_of[project]],
+            note=bd.note, mode="rmtree", project=project,
         ))
     return items
 
@@ -924,8 +954,7 @@ def _cmd_action(cmd: list[str], timeout: float = 60, cwd: Path | None = None,
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise CleanupDeferred(
-                            f"timed out after {timeout:g}s; client stopped, cleanup may be partial. "
-                            "A service/daemon request may still be running; later actions in this group are skipped")
+                            f"timed out after {timeout:g}s; client stopped, cleanup may be partial")
                     try:
                         stdout, stderr = process.communicate(timeout=min(0.2, remaining))
                         break
@@ -1254,7 +1283,7 @@ def run_docker_audit() -> bool:
     df = results["disk usage"] or {}
     stats = results["container memory"]
     builders, local, caches = results["builder caches"] or ([], {}, {})
-    table = Table(title="🐳  Docker disk usage (daemon)", box=ROUNDED, title_justify="left", expand=True)
+    table = Table(title="Docker disk usage (daemon)", **TABLE, title_justify="left", expand=True)
     for label in ("resource", "total", "active", "size", "reclaimable"):
         table.add_column(label)
     for kind, values in df.items():
@@ -1274,7 +1303,7 @@ def run_docker_audit() -> bool:
                     containers.append((d, mem))
             except (ValueError, AttributeError):
                 continue
-        table = Table(title="🧠  running containers", box=ROUNDED, title_justify="left", expand=True)
+        table = Table(title="running containers", **TABLE, title_justify="left", expand=True)
         table.add_column("memory", justify="right")
         table.add_column("CPU %", justify="right")
         table.add_column("container")
@@ -1288,7 +1317,7 @@ def run_docker_audit() -> bool:
     console.print(Text("Container stats and host VM footprint use different accounting; their difference is not all VM overhead. "
                        "Guest caches and services also use memory.", style="dim"))
 
-    table = Table(title="🏗️  buildx builders and container-builder caches", box=ROUNDED,
+    table = Table(title="buildx builders and container-builder caches", **TABLE,
                   title_justify="left", expand=True)
     for label in ("builder", "driver / status", "last activity", "reclaimable", "endpoint / notes"):
         table.add_column(label, overflow="fold")
@@ -1529,6 +1558,10 @@ def live_cwds() -> frozenset[Path]:
         r = run([lsof, "-a", "-d", "cwd", "-Fn"], timeout=15)  # exits 1 when some processes are unreadable
         if r:
             cwds.update(line[1:] for line in r.stdout.splitlines() if line.startswith("n/"))
+    # A server started elsewhere still runs out of the dir holding its executable or script.
+    r = run(["ps", "-A", "-ww", "-o", "command="], timeout=15)
+    if r and r.returncode == 0:
+        cwds.update(token for line in r.stdout.splitlines() for token in line.split() if token.startswith("/"))
     busy: set[Path] = set()
     for cwd in cwds:
         p = Path(cwd)
@@ -1617,7 +1650,8 @@ def _sweep_action(entries: list[Path], cutoff: float) -> Callable[[], str | None
         if failed and not removed:
             raise RuntimeError(f"could not remove any of {failed} entries")
         if failed:
-            raise CleanupDeferred(f"removed {removed}, {failed} failed, {skipped} back in use")
+            raise CleanupPartial(f"removed {removed}, {failed} could not be removed"
+                                 + (f", {skipped} back in use" if skipped else ""))
         return (f"removed {removed}" + (f", {failed} failed" if failed else "")
                 + (f", {skipped} back in use" if skipped else ""))
     return act
@@ -2170,8 +2204,8 @@ def render_memory(procs: list[Proc], ctx: Context, *, previous: list[Proc] | Non
         parts.append(Text(f"Δ over {elapsed:.1f}s; surviving PIDs only. New processes show ‘new’; exits are excluded."
                           if elapsed is not None else "Δ compares surviving PIDs only; exits are excluded.", style="dim"))
 
-    table = Table(title="🧠  memory by " + ("process family" if by_tree else "program (reported executable)"),
-                  box=ROUNDED, border_style="magenta", title_justify="left", expand=True)
+    table = Table(title="memory by " + ("process family" if by_tree else "program (reported executable)"),
+                  **TABLE, title_justify="left", expand=True)
     for label in ("memory", "Δ", "CPU %", "procs", "old/low"):
         table.add_column(label, justify="right")
     table.add_column("root PID" if by_tree else "top PID", justify="right")
@@ -2192,8 +2226,8 @@ def render_memory(procs: list[Proc], ctx: Context, *, previous: list[Proc] | Non
     parts.append(table)
     parts.append(Text(f"Showing {min(top, len(groups))} / {len(groups)} groups. Old / low CPU means age ≥ "
                       f"{min_age / 86400:.2g}d and ps CPU ≤1%; it does not establish inactivity or a leak.", style="dim"))
-    detail = Table(title="🔎  individual processes (same sort and filter)", box=ROUNDED,
-                   border_style="magenta", title_justify="left", expand=True)
+    detail = Table(title="individual processes (same sort and filter)", **TABLE,
+                   title_justify="left", expand=True)
     for label in ("PID", "PPID", "memory", "Δ", "CPU %", "age"):
         detail.add_column(label, justify="right")
     detail.add_column("owner", overflow="fold" if full else "ellipsis", no_wrap=not full)
@@ -2238,8 +2272,8 @@ def render_sessions(procs: list[Proc], ctx: Context, commands: dict[int, str], *
     idle = sorted(idle_sessions(terminal_sessions(procs), min_idle), key=lambda s: (-s.mem, s.tty))
     if not idle:
         return []
-    table = Table(title=f"💤  terminal sessions silent ≥{_duration(min_idle)} (no input, output, new process or CPU)",
-                  box=ROUNDED, border_style="magenta", title_justify="left", expand=True)
+    table = Table(title=f"terminal sessions silent ≥{_duration(min_idle)} (no input, output, new process or CPU)",
+                  **TABLE, title_justify="left", expand=True)
     for label in ("memory", "silent", "procs", "oldest"):
         table.add_column(label, justify="right")
     table.add_column("tty")
@@ -2343,8 +2377,8 @@ def render_cpu(before: list[Proc], procs: list[Proc], elapsed: float, *, command
                       "attributed: a load far above the busy cores means many of them, or processes waiting on disk.",
                       style="dim"))
 
-    table = Table(title="🔥  CPU by " + ("process family" if by_tree else "program (reported executable)"),
-                  box=ROUNDED, border_style="magenta", title_justify="left", expand=True)
+    table = Table(title="CPU by " + ("process family" if by_tree else "program (reported executable)"),
+                  **TABLE, title_justify="left", expand=True)
     for label in ("now %", "CPU time", "memory", "procs"):
         table.add_column(label, justify="right")
     table.add_column("root PID" if by_tree else "top PID", justify="right")
@@ -2361,7 +2395,7 @@ def render_cpu(before: list[Proc], procs: list[Proc], elapsed: float, *, command
     parts.append(table)
 
     def process_table(title: str, rows: list[Proc]) -> Table:
-        t = Table(title=title, box=ROUNDED, border_style="magenta", title_justify="left", expand=True)
+        t = Table(title=title, **TABLE, title_justify="left", expand=True)
         for label in ("PID", "PPID", "now %", "avg %", "CPU time", "age", "memory"):
             t.add_column(label, justify="right")
         t.add_column("command", overflow="fold" if full else "ellipsis", no_wrap=not full, ratio=2)
@@ -2373,7 +2407,7 @@ def render_cpu(before: list[Proc], procs: list[Proc], elapsed: float, *, command
         return t
 
     current = sorted(selected, key=lambda p: (-rates.get(p.pid, 0.0), -p.cpu_time, p.pid))
-    parts.append(process_table("🔎  busiest processes right now", current[:top]))
+    parts.append(process_table("busiest processes right now", current[:top]))
     sustained = sorted((p for p in selected if p.age >= SUSTAINED_AGE and average(p) >= SUSTAINED_AVG),
                        key=lambda p: (-p.cpu_time, p.pid))
     if sustained:
@@ -2636,22 +2670,48 @@ def partition(items: list[Item], ctx: Context):
 # ---------------------------------------------------------------------------
 
 
-def disk_line(path: Path = HOME) -> Text:
+def _bar(fraction: float, color: str, width: int = 24) -> Text:
+    filled = min(width, max(0, round(fraction * width)))
+    return Text("━" * filled, style=color).append("━" * (width - filled), style="grey30")
+
+
+def _section(title: str, detail: str = "") -> Text:
+    return Text.assemble((title, "bold"), ("  " + detail if detail else "", "dim"))
+
+
+def _grid(rows: list[tuple], *, styles: tuple[str, ...] = (), right: tuple[int, ...] = (),
+          wrap_last: bool = True) -> Padding:
+    """Aligned, borderless rows indented under a section heading. The last column takes the slack."""
+    width = max(len(r) for r in rows)
+    grid = Table.grid(padding=(0, 2), expand=True)
+    for n in range(width):
+        last = n == width - 1
+        # Leading columns keep their full width: only the last one gives way on a narrow terminal.
+        fixed = None if last else max((Text(c).cell_len if isinstance(c, str) else c.cell_len)
+                                      for c in (r[n] if n < len(r) else "" for r in rows))
+        grid.add_column(style=styles[n] if n < len(styles) else "", justify="right" if n in right else "left",
+                        min_width=fixed, ratio=1 if last else None, no_wrap=not (last and wrap_last),
+                        overflow="fold" if last and wrap_last else "ellipsis")
+    for row in rows:
+        grid.add_row(*row, *[""] * (width - len(row)))
+    return Padding(grid, (0, 0, 0, 2))
+
+
+def health_rows(disk_was: int | None = None) -> list[tuple[str, Text]]:
+    """Disk, memory and CPU at a glance. Missing counters are left out, never guessed."""
+    rows: list[tuple[str, Text]] = []
     try:
-        u = shutil.disk_usage(path)
+        u = shutil.disk_usage(HOME)
     except OSError:
-        return Text("")
-    pct = u.used / u.total * 100 if u.total else 0
-    color = "red bold" if u.free < 20 * 1024**3 or pct > 90 else "yellow" if pct > 80 else "green"
-    return Text.from_markup(
-        f"[dim]disk:[/] [{color}]{human_size(u.free)} free[/] [dim]of {human_size(u.total)} "
-        f"({pct:.0f}% used)[/]"
-    )
-
-
-def health_lines() -> list[Text]:
-    """Memory and CPU at a glance, next to the disk line. Missing counters are left out, never guessed."""
-    out = []
+        u = None
+    if u is not None and u.total:
+        pct = u.used / u.total
+        color = "red bold" if u.free < 20 * 1024**3 or pct > 0.9 else "yellow" if pct > 0.8 else "green"
+        line = Text.assemble((f"{human_size(u.free)} free", color), (f" of {human_size(u.total)}  ", "dim"),
+                             _bar(pct, color.split()[0]), (f"  {pct * 100:.0f}% used", "dim"))
+        if disk_was is not None:
+            line.append(f"  was {human_size(disk_was)} free", style="dim")
+        rows.append(("disk", line))
     mem = system_memory()
     if "RAM" in mem:
         ram, swap = mem["RAM"], mem.get("swap_used", 0)
@@ -2660,65 +2720,66 @@ def health_lines() -> list[Text]:
         color = "red bold" if ratio > (0.5 if "available" not in mem else 0.9) else "yellow" if ratio > (0.25 if "available" not in mem else 0.75) else "green"
         detail = (f"{human_size(mem['available'])} available" if "available" in mem else
                   f"{human_size(mem.get('compressed', 0))} compressed")
-        out.append(Text.from_markup(
-            f"[dim]memory:[/] [{color}]{detail}[/] [dim]of {human_size(ram)}"
-            + (f", {human_size(swap)} swapped" if swap else "") + "[/]"))
+        rows.append(("memory", Text.assemble(
+            (detail, color), (f" of {human_size(ram)}" + (f" · {human_size(swap)} swapped" if swap else ""), "dim"))))
     try:
         load, cores = os.getloadavg()[0], os.cpu_count() or 1
         color = "red bold" if load > 2 * cores else "yellow" if load > cores else "green"
-        out.append(Text.from_markup(f"[dim]cpu:[/] [{color}]load {load:.1f}[/] [dim]on {cores} cores[/]"))
+        rows.append(("cpu", Text.assemble((f"load {load:.1f}", color), (f" on {cores} cores", "dim"))))
     except OSError:
         pass
-    return out
+    return rows
 
 
-def banner() -> Panel:
-    title = Text("🧹  dev-cleaner", style="bold magenta")
-    subtitle = Text("\nfree the disk, memory and CPU that dev work leaves behind", style="dim")
-    return Panel(Group(title, subtitle, disk_line(), *health_lines()), box=ROUNDED, border_style="magenta",
-                 padding=(0, 2))
+def health_grid(disk_was: int | None = None) -> Padding:
+    return _grid(health_rows(disk_was), styles=("dim",), wrap_last=False)
 
 
-def render_summary(items: list[Item], threshold: str, aggressive: bool) -> Table:
-    table = Table(title=f"Cleanup · disk, memory and CPU · project dirs idle >{threshold}"
-                        + (" · aggressive" if aggressive else ""),
-                  box=ROUNDED, expand=True, title_justify="left")
-    table.add_column("Cleaner", no_wrap=True)
-    table.add_column("Targets", justify="right", no_wrap=True)
+def banner() -> Group:
+    return Group(Text("dev-cleaner", style="bold"), health_grid())
+
+
+def render_summary(items: list[Item], threshold: str, aggressive: bool) -> Group:
+    """The plan in one screen: one row per cleaner, never one per path."""
     running = [i for i in items if i.ram]
-    items = [i for i in items if not i.ram]
-    measured = any(i.size is not None for i in items) or bool(running)
-    if measured:
-        table.add_column("Frees", justify="right", no_wrap=True)
-    table.add_column("Includes", no_wrap=True, overflow="ellipsis", ratio=1)
+    disk = [i for i in items if not i.ram]
+    measured = any(i.size is not None for i in disk) or bool(running)
+    rows: list[tuple] = []
+    for item in running:  # memory and CPU first: they are what makes the machine slow right now
+        frees = human_size(item.size) + " RAM" + (f" · {item.cores:.1f} cores" if item.cores else "")
+        rows.append(("cpu" if item.cores else "memory", item.note.split(" ", 1)[0], Text(frees, style="cyan"),
+                     Text(f"{item.label}: {item.note}")))
     groups: dict[str, list[Item]] = defaultdict(list)
-    for item in items:
+    for item in disk:
         groups[item.group].append(item)
-    if running:  # memory and CPU first: they are what makes the machine slow right now
-        for n, item in enumerate(running):
-            frees = Text(human_size(item.size) + " RAM" + (f" · {item.cores:.1f} cores" if item.cores else ""),
-                         style="cyan")
-            table.add_row("🧠 memory" if not item.cores else "🔥 cpu", item.note.split(" ", 1)[0], frees,
-                          Text(f"{item.label}: {item.note}"), end_section=n == len(running) - 1 and bool(groups))
     for group, members in groups.items():
         labels = list(dict.fromkeys(i.label for i in members))
         detail = ", ".join(labels[:4]) + (f", +{len(labels) - 4} more" if len(labels) > 4 else "")
-        row = [group, str(len(members))]
+        row: list = [group, str(len(members))]
         if measured:
             known = sum(i.size or 0 for i in members)
-            row.append((human_size(known) + ("+" if any(i.size is None for i in members) else ""))
-                       if any(i.size is not None for i in members) else "—")
-        table.add_row(*row, Text(detail))
-    return table
+            row.append(Text(human_size(known) + ("+" if any(i.size is None for i in members) else ""),
+                            style=size_color(known))
+                       if any(i.size is not None for i in members) else Text("—", style="dim"))
+        rows.append((*row, Text(detail)))
+    detail = f"{len(items)} target{'s' if len(items) != 1 else ''} · project builds idle over {threshold}"
+    if any(i.size is not None for i in disk):
+        total = sum(i.size or 0 for i in disk)
+        detail += f" · frees {human_size(total)}" + ("+" if any(i.size is None for i in disk) else "")
+    if aggressive:
+        detail += " · aggressive"
+    styles = ("bold", "dim", "", "dim") if measured else ("bold", "dim", "dim")
+    return Group(_section("Will clean", detail), _grid(rows, styles=styles, right=(1, 2) if measured else (1,),
+                                                       wrap_last=False))
 
 
 def render_table(items: list[Item], threshold: str, aggressive: bool) -> Table:
-    title = "🧹  reclaimable"
+    title = "reclaimable"
     if aggressive:
         title += " [red](aggressive)[/]"
     table = Table(
         title=f"[bold]{title}[/] [dim](project dirs idle >{threshold})[/]",
-        box=ROUNDED, border_style="magenta", header_style="bold magenta",
+        **TABLE,
         title_justify="left", show_lines=False, expand=True,
     )
     table.add_column("#", style="dim", width=3, justify="right")
@@ -2738,7 +2799,7 @@ def render_table(items: list[Item], threshold: str, aggressive: bool) -> Table:
         if gi:
             table.add_section()
         table.add_row("", "", "", Text.from_markup(
-            f"{GROUP_EMOJI.get(g, '')} [bold]{g}[/]" + (f"  [dim]{human_size(totals[g])}[/]" if totals[g] else "")))
+            f"[bold]{g}[/]" + (f"  [dim]{human_size(totals[g])}[/]" if totals[g] else "")))
         for it in (i for i in items if i.group == g):
             n += 1
             if it.mtime is not None:
@@ -2772,41 +2833,47 @@ def render_table(items: list[Item], threshold: str, aggressive: bool) -> Table:
     return table
 
 
-def render_notes(active: list[Item], extra: list[Item], threshold: str, warnings: list[str]) -> list[Text]:
+_WARNING_TOPIC = re.compile(r"^([a-z][a-z ]{1,15}): (.+)$", re.S)
+
+
+def render_notes(active: list[Item], extra: list[Item], threshold: str, warnings: list[str]) -> list[Group]:
+    """What this run leaves alone and how to include it, then what the scan could not do."""
     out = []
+    left: list[tuple] = []
     active = [i for i in active if i.mtime != float("inf")]
     if active:
-        total = sum(i.size or 0 for i in active)
         projects = {i.project for i in active}
-        measured = sum(i.size is not None for i in active)
-        size_note = (f"holding[/] [{size_color(total)}]{human_size(total)}[/] " if measured == len(active)
-                     else "[dim](sizes skipped; use --audit to measure them)[/] ")
-        out.append(Text.from_markup(
-            f"[dim]skipped[/] [bold]{len(active)}[/] [dim]build dir(s) in {len(projects)} active project(s) "
-            + size_note +
-            f"[dim](edited within {threshold}). include them with[/] [bold]--hours N[/]"
-        ))
+        what = f"{len(active)} build dir(s) in {len(projects)} project(s) edited within {threshold}"
+        if all(i.size is not None for i in active):
+            total = sum(i.size or 0 for i in active)
+            left.append(("--hours N", Text.assemble(what, " holding ", (human_size(total), size_color(total)))))
+        else:
+            left.append(("--hours N", Text(what + " (sizes skipped; use --audit to measure them)")))
     if extra:
-        total = sum(i.size or 0 for i in extra)
-        top = ", ".join(i.label + (f" {human_size(i.size)}" if i.size is not None else "") for i in extra[:4])
-        more = f", +{len(extra) - 4} more" if len(extra) > 4 else ""
-        space = human_size(total) if all(i.size is not None for i in extra) else "unmeasured space"
-        out.append(Text(f"{space} in {len(extra)} dependency cache(s) / unused image(s) with --aggressive: "
-                        f"{top}{more}", style="dim"))
-
-    for w in warnings:
-        out.append(Text.from_markup(f"[yellow]![/] [dim]{escape(w)}[/]"))
+        top = ", ".join(i.label + (f" {human_size(i.size)}" if i.size is not None else "") for i in extra[:3])
+        more = f", +{len(extra) - 3} more" if len(extra) > 3 else ""
+        space = (human_size(sum(i.size or 0 for i in extra)) + " in " if all(i.size is not None for i in extra) else "")
+        left.append(("--aggressive", Text.assemble(
+            f"{space}{len(extra)} dependency cache(s) / unused image(s)", (f": {top}{more}", "dim"))))
+    if left:
+        out.append(Group(_section("Left alone", "add the flag to include it"), _grid(left, styles=("cyan",))))
+    if warnings:
+        rows = []
+        for w in warnings:
+            m = _WARNING_TOPIC.match(w)
+            rows.append((m.group(1), Text(m.group(2))) if m else ("note", Text(w)))
+        out.append(Group(_section("Notes"), _grid(rows, styles=("yellow",))))
     return out
 
 
 def render_groups_table() -> Table:
-    t = Table(box=ROUNDED, border_style="magenta", header_style="bold magenta", expand=True)
+    t = Table(**TABLE, expand=True)
     t.add_column("group", style="bold")
     t.add_column("default", overflow="fold")
     t.add_column("--aggressive adds", overflow="fold", style="dim")
     for g in ALL_GROUPS:
         safe, aggr = GROUP_HELP.get(g, ("", ""))
-        t.add_row(f"{GROUP_EMOJI.get(g, '')} {g}", safe or "—", aggr or "—")
+        t.add_row(g, safe or "—", aggr or "—")
     return t
 
 
@@ -2954,8 +3021,8 @@ def run_audit(ctx: Context, to_clean: list[Item], active: list[Item], extra: lis
     vm = {p: name for name, p in docker_vm_disks()}
 
     table = Table(
-        title="[bold]🔎  where the disk went[/] [dim](dirs over 1 GB, and what dev-cleaner frees in each)[/]",
-        box=ROUNDED, border_style="magenta", header_style="bold magenta", title_justify="left", expand=True,
+        title="[bold]where the disk went[/] [dim](dirs over 1 GB, and what dev-cleaner frees in each)[/]",
+        **TABLE, title_justify="left", expand=True,
     )
     table.add_column("size", justify="right", min_width=9)
     table.add_column("frees now", justify="right", min_width=9)
@@ -2996,6 +3063,180 @@ def run_audit(ctx: Context, to_clean: list[Item], active: list[Item], extra: lis
             f"[yellow]![/] [dim]{human_size(blind)} sits in dirs dev-cleaner does not touch. project dirs: add them "
             f"to[/] [bold]roots[/] [dim](or pass[/] [bold]--root[/][dim]). disposable dirs of your own tools: "
             f"declare them under[/] [bold]\\[\\[extra]][/] [dim]in the config.[/]"))
+
+
+# ---------------------------------------------------------------------------
+# Dedupe: identical files across checkouts share their blocks (APFS clones)
+# ---------------------------------------------------------------------------
+
+DEDUPE_SKIP = {".git", ".hg", ".svn"}      # VCS internals are left exactly as their tool wrote them
+DEDUPE_SETTLE = 600                        # seconds a file must have been quiet: nothing is still writing it
+
+
+def _clone(src: str, dst: str) -> None:
+    """Copy-on-write copy: `dst` shares `src`'s blocks until either one is written to."""
+    if not IS_MAC:
+        raise OSError(errno.ENOTSUP, "copy-on-write clones need APFS (macOS)")
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.clonefile(os.fsencode(src), os.fsencode(dst), 1) != 0:  # 1 = CLONE_NOFOLLOW
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), dst)
+
+
+def _digest(path: str) -> bytes | None:
+    h = hashlib.blake2b(digest_size=20)
+    try:
+        with open(path, "rb", buffering=0) as f:
+            while chunk := f.read(1 << 20):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.digest()
+
+
+def dedupe_scan(roots: list[Path], min_size: int, on_dir: Callable[[str, int], None] | None = None
+                ) -> dict[int, list[tuple[str, os.stat_result]]]:
+    """Regular files of ours, by size, wherever at least two share one. Hard links and symlinks stay out."""
+    by_size: dict[int, list[tuple[str, os.stat_result]]] = defaultdict(list)
+    uid, settled, seen, count = os.getuid(), time.time() - DEDUPE_SETTLE, set(), 0
+    for root in roots:
+        try:
+            dev = os.stat(root).st_dev
+        except OSError:
+            continue
+        stack = [str(root)]
+        while stack:
+            here = stack.pop()
+            if on_dir is not None:
+                on_dir(here, count)
+            try:
+                with os.scandir(here) as entries:
+                    for e in entries:
+                        try:
+                            if e.is_symlink():
+                                continue
+                            st = e.stat(follow_symlinks=False)
+                            if st.st_dev != dev:
+                                continue
+                            if stat.S_ISDIR(st.st_mode):
+                                if e.name not in DEDUPE_SKIP:
+                                    stack.append(e.path)
+                            elif (stat.S_ISREG(st.st_mode) and st.st_size >= min_size and st.st_nlink == 1
+                                  and st.st_uid == uid and st.st_mtime < settled and (dev, st.st_ino) not in seen):
+                                seen.add((dev, st.st_ino))
+                                by_size[st.st_size].append((e.path, st))
+                                count += 1
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+    return {size: files for size, files in by_size.items() if len(files) > 1}
+
+
+def _share(src: str, src_st: os.stat_result, dst: str, dst_st: os.stat_result) -> bool:
+    """Replace `dst` with a clone of the identical `src`, keeping dst's mode and times. False = left alone."""
+    try:
+        a, b = os.lstat(src), os.lstat(dst)
+        if ((a.st_size, a.st_mtime_ns) != (src_st.st_size, src_st.st_mtime_ns)
+                or (b.st_size, b.st_mtime_ns, b.st_nlink) != (dst_st.st_size, dst_st.st_mtime_ns, 1)):
+            return False  # either file changed since it was hashed
+        parent = os.path.dirname(dst)
+        parent_st = os.stat(parent)
+        tmp = os.path.join(parent, f".dev-cleaner-clone-{os.getpid()}-{get_ident()}")
+        _clone(src, tmp)
+        try:
+            os.chmod(tmp, stat.S_IMODE(b.st_mode))
+            os.utime(tmp, ns=(b.st_atime_ns, b.st_mtime_ns))
+            os.replace(tmp, dst)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return False
+        os.utime(parent, ns=(parent_st.st_atime_ns, parent_st.st_mtime_ns))  # the swap must not make a project look edited
+        return True
+    except OSError:
+        return False
+
+
+def dedupe_sets(by_size: dict[int, list[tuple[str, os.stat_result]]], workers: int,
+                on_done: Callable[[int, int], None] | None = None) -> list[list[tuple[str, os.stat_result]]]:
+    """Sets of byte-identical files (two or more each), biggest saving first."""
+    files = [f for group in by_size.values() for f in group]
+    sets: dict[tuple[int, bytes], list[tuple[str, os.stat_result]]] = defaultdict(list)
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        for n, (f, digest) in enumerate(zip(files, pool.map(lambda f: _digest(f[0]), files)), 1):
+            if digest is not None:
+                sets[(f[1].st_size, digest)].append(f)
+            if on_done is not None and n % 500 == 0:
+                on_done(n, len(files))
+    out = [group for group in sets.values() if len(group) > 1]
+    out.sort(key=lambda group: -group[0][1].st_size * (len(group) - 1))
+    return out
+
+
+def run_dedupe(roots: list[Path], min_size: int, workers: int, *, dry_run: bool, yes: bool) -> bool:
+    roots = [r for r in (Path(r).expanduser().resolve() for r in roots) if r.is_dir()]
+    if not roots:
+        console.print("[red bold]error:[/] --dedupe needs existing dirs: pass --root PATH or set paths under \\[dedupe]")
+        return False
+    if not IS_MAC:
+        console.print("[red bold]error:[/] --dedupe needs APFS copy-on-write clones (macOS)")
+        return False
+    console.print()
+    with console.status("") as status:
+        last = [0.0]
+
+        def walking(here: str, count: int) -> None:
+            if time.monotonic() - last[0] > 0.2:
+                last[0] = time.monotonic()
+                status.update(Text(f"listing files · {count:,} candidates · {tilde(here)}", no_wrap=True, overflow="ellipsis"))
+        by_size = dedupe_scan(roots, min_size, walking)
+        total = sum(len(g) for g in by_size.values())
+        status.update(f"comparing {total:,} files")
+        sets = dedupe_sets(by_size, workers, lambda n, m: status.update(f"comparing {n:,}/{m:,} files"))
+    extra = sum(len(g) - 1 for g in sets)
+    dup = sum(g[0][1].st_size * (len(g) - 1) for g in sets)
+    if not sets:
+        console.print("[bold]No duplicate files found.[/]")
+        return True
+    per_root: dict[Path, int] = defaultdict(int)
+    for g in sets:
+        for path, st in g[1:]:
+            per_root[next((r for r in roots if path.startswith(str(r) + os.sep)), roots[0])] += st.st_size
+    console.print(_section("Will share", f"{extra:,} duplicate files in {len(sets):,} sets · up to {human_size(dup)}"))
+    console.print(_grid([(Text(human_size(n), style=size_color(n)), Text(tilde(r)))
+                         for r, n in sorted(per_root.items(), key=lambda kv: -kv[1])], right=(0,)))
+    console.print(Text("\n  Each duplicate becomes a copy-on-write clone of one original: same content, mode and times, "
+                       "no file removed.\n  Copies already sharing blocks free nothing, so the real saving is "
+                       "measured after. du keeps counting every copy.", style="dim"))
+    if dry_run:
+        console.print("\n[dim]dry-run — no changes made.[/]\n")
+        return True
+    if not yes and not Confirm.ask(f"\n[bold]Share these {extra:,} files?[/]", default=False):
+        console.print("[yellow]aborted.[/]")
+        return True
+    free_before, started = shutil.disk_usage(HOME).free, time.monotonic()
+    shared = skipped = 0
+    with console.status("sharing") as status:
+        with ThreadPoolExecutor(max_workers=DEFAULTS["clean_jobs"]) as pool:
+            def one(group: list[tuple[str, os.stat_result]]) -> tuple[int, int]:
+                (src, src_st), ok = group[0], 0
+                for dst, dst_st in group[1:]:
+                    ok += _share(src, src_st, dst, dst_st)
+                return ok, len(group) - 1 - ok
+            for n, (ok, bad) in enumerate(pool.map(one, sets), 1):
+                shared, skipped = shared + ok, skipped + bad
+                if n % 200 == 0:
+                    status.update(f"sharing · {shared:,}/{extra:,} files")
+    freed = max(0, shutil.disk_usage(HOME).free - free_before)
+    console.print()
+    console.print(Text.assemble(("Freed ", "bold"), (human_size(freed), "bold green"),
+                                (f"  in {_elapsed(time.monotonic() - started)} · {shared:,} files now share their blocks", "dim"),
+                                (f" · {skipped:,} left alone (changed, or in a read-only dir)" if skipped else "", "yellow")))
+    console.print(health_grid(disk_was=free_before))
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -3105,7 +3346,7 @@ def clean_all(items: list[Item], workers: int, roots: list[Path], *, verbose: bo
                         state = "done" if error is None else "incomplete" if isinstance(error, CleanupDeferred) else "failed"
                         slots[slot] = (state, item.label, slots[slot][2], time.monotonic())
                         remaining = lane[1:]
-                        if isinstance(error, CleanupDeferred):
+                        if isinstance(error, CleanupDeferred) and not isinstance(error, CleanupPartial):
                             for skipped in remaining:
                                 report(skipped, None, CleanupDeferred("skipped after an incomplete cleanup in this group"))
                             remaining = []
@@ -3118,28 +3359,32 @@ def clean_all(items: list[Item], workers: int, roots: list[Path], *, verbose: bo
             finally:
                 cancelled.set()
     # Successful paths are opt-in. Failures remain visible in normal output.
+    rows = []
     if not verbose:
         counts: dict[str, int] = defaultdict(int)
         for item, _, error in outcomes.values():
             if error is None:
                 counts[item.group] += 1
         if counts:
-            console.print(Text("Cleaned: " + " · ".join(f"{g} {n}" for g, n in counts.items()), style="green"))
+            rows.append((Text("✓", style="green"), "cleaned", Text(" · ".join(f"{g} {n}" for g, n in counts.items()))))
     for item in items:
         if id(item) not in outcomes:
             continue
         _, note, error = outcomes[id(item)]
         if error is None and not verbose:
             continue
-        label = Text("  ✓ " if error is None else "  ! " if isinstance(error, CleanupDeferred) else "  ✗ ",
-                     style="green" if error is None else "yellow" if isinstance(error, CleanupDeferred) else "red")
-        label.append(tilde(item.project) + "  " + item.label if item.is_project else item.label)
-        if item.path is not None and not item.is_project:
-            label.append("  " + tilde(item.path), style="dim")
+        deferred = isinstance(error, CleanupDeferred)
+        mark = Text("✓" if error is None else "!" if deferred else "✗",
+                    style="green" if error is None else "yellow" if deferred else "red")
+        what = Text(tilde(item.project) + "  " + item.label if item.is_project else item.label)
+        if verbose and item.path is not None and not item.is_project:
+            what.append("  " + tilde(item.path), style="dim")
         detail = str(error) if error is not None else note
         if detail:
-            label.append(" — " + detail, style="dim")
-        console.print(label)
+            what.append("  " + detail, style="dim")
+        rows.append((mark, item.group, what))
+    if rows:
+        console.print(_grid(rows, styles=("", "bold")))
     return result
 
 
@@ -3215,8 +3460,9 @@ def init_wizard(path: Path, scan_root: Path | None = None) -> bool:
     ).strip()
     ignores = [s.strip() for s in extra.split(",") if s.strip()] if extra else []
     days = FloatPrompt.ask("  [bold]min idle age in days[/]", default=DEFAULTS["days"])
-    aggressive = Confirm.ask(
-        "  [bold]aggressive by default?[/] [dim](also wipe dependency download caches)[/]", default=False)
+    aggressive: bool | str = Confirm.ask(
+        "  [bold]always wipe dependency download caches?[/] [dim](no = only when the disk is tight)[/]",
+        default=False) or "auto"
     skip_raw = Prompt.ask(
         f"  [bold]groups to never run[/] [dim](comma-separated from: {', '.join(ALL_GROUPS)}; blank for none)[/]",
         default="", show_default=False,
@@ -3274,8 +3520,12 @@ def main() -> int:
     age.add_argument("--hours", type=float, default=None, help="Project idle age in hours")
     p.add_argument("-n", "--dry-run", action="store_true", help="List what would be cleaned, change nothing")
     p.add_argument("-y", "--yes", action="store_true", help="Skip the confirmation prompt")
-    p.add_argument("-a", "--aggressive", action="store_true",
-                   help="Also clean dependency download caches and all unused docker images")
+    tier = p.add_mutually_exclusive_group()
+    tier.add_argument("-a", "--aggressive", action="store_true",
+                      help="Also clean dependency download caches and all unused docker images "
+                           "(automatic once under 15%% of the disk is free)")
+    tier.add_argument("--gentle", action="store_true",
+                      help="Keep dependency caches and the configured idle age even when the disk is tight")
     p.add_argument("--only", metavar="GROUPS", help="Comma-separated groups to run (e.g. rust,docker)")
     p.add_argument("--skip", metavar="GROUPS", help="Comma-separated groups to skip")
     reports = p.add_mutually_exclusive_group()
@@ -3298,6 +3548,8 @@ def main() -> int:
                    help="Show full paths and commands, wrapping to fit (with --mem or --cpu)")
     p.add_argument("--mem-sort", choices=("memory", "cpu", "growth"), help="Sort memory tables (default memory)")
     p.add_argument("--mem-watch", type=float, metavar="SECONDS", help="Refresh memory and show growth (requires --mem)")
+    p.add_argument("--dedupe", action="store_true",
+                   help="Make identical files across --root dirs (or [dedupe] paths) share disk blocks; removes nothing")
     p.add_argument("--list", action="store_true", help="List cleaner groups and exit")
     p.add_argument("--size-jobs", type=int, default=None, help="Parallel sizing workers")
     p.add_argument("--sizes", action="store_true", help="Measure directory and Docker cache sizes (slower; skipped by default)")
@@ -3333,6 +3585,8 @@ def main() -> int:
         console.print(render_groups_table())
         return 0
 
+    if console.width > MAX_WIDTH and not args.mem_full:
+        console.width = MAX_WIDTH
     console.print(banner())
     if args.cpu:
         ok = run_cpu(sample=args.cpu_sample or 2.0, top=args.mem_top or 10, pattern=args.mem_filter or "",
@@ -3373,7 +3627,12 @@ def main() -> int:
     if (not isinstance(command_timeout, (int, float)) or not math.isfinite(command_timeout)
             or command_timeout <= 0):
         p.error("--command-timeout / command_timeout must be a finite positive number of seconds")
-    aggressive = args.aggressive or bool(cfg.get("aggressive"))
+    scan_seconds = cfg["scan_seconds"]
+    if isinstance(scan_seconds, bool) or not isinstance(scan_seconds, (int, float)) or not 0 < scan_seconds < math.inf:
+        p.error("scan_seconds must be a finite positive number of seconds")
+    setting = cfg.get("aggressive")
+    if setting != "auto" and not isinstance(setting, bool):
+        p.error('aggressive must be true, false or "auto"')
     volumes = docker_cfg.get("volumes")
     docker_volumes: bool | str = "all" if volumes == "all" else bool(volumes)
 
@@ -3390,6 +3649,18 @@ def main() -> int:
         age_hours, threshold = args.days * 24, f"{args.days:g}d"
     else:
         age_hours, threshold = cfg["days"] * 24, f"{cfg['days']:g}d"
+
+    # Tier: explicit flags and true/false in the config win; "auto" follows the disk.
+    level, free, total = disk_pressure()
+    auto = setting == "auto" and not args.aggressive and not args.gentle and level != "ok"
+    aggressive = not args.gentle and (args.aggressive or setting is True or auto)
+    mode_note = ""
+    if auto:
+        mode_note = (f"under {(CRITICAL_FREE if level == 'critical' else TIGHT_FREE):.0%} free: "
+                     "dependency caches and unused images included")
+        if level == "critical" and args.hours is None and args.days is None and age_hours > CRITICAL_HOURS:
+            age_hours, threshold = CRITICAL_HOURS, f"{CRITICAL_HOURS:g}h"
+            mode_note += f", idle age cut to {threshold}"
 
     now = time.time()
     try:
@@ -3419,10 +3690,10 @@ def main() -> int:
         src = ("legacy rust-clean config" if legacy else "config file") if cfg_path.exists() else "built-in defaults"
         console.print(f"  [dim]source:[/] {src} [dim]({cfg_path})[/]")
         console.print(f"  [bold]roots[/]       = {[tilde(r) for r in roots]}")
-        console.print(f"  [bold]scan[/]        = {'thorough' if args.thorough or args.audit else 'caches only' if args.caches_only else '10-second budget'}")
+        console.print(f"  [bold]scan[/]        = {'thorough' if args.thorough or args.audit else 'caches only' if args.caches_only else f'{scan_seconds:g}-second budget'}")
         console.print(f"  [bold]ignore[/]      = {sorted(extra_skip)}")
         console.print(f"  [bold]days[/]        = {age_hours / 24:g}")
-        console.print(f"  [bold]aggressive[/]  = {aggressive}")
+        console.print(f"  [bold]aggressive[/]  = {setting!r} [dim](this run: {aggressive}; disk {level})[/]")
         console.print(f"  [bold]groups[/]      = {[g for g in ALL_GROUPS if g in groups]}")
         console.print(f"  [bold]docker.volumes[/] = {docker_volumes}")
         console.print(f"  [bold]tmp.days[/]    = {tmp_cfg.get('days', age_hours / 24):g}")
@@ -3454,9 +3725,17 @@ def main() -> int:
         command_timeout=command_timeout,
         measure_sizes=args.sizes or args.audit,
         tmp_cutoff=tmp_cutoff, tmp_claude_scratch=tmp_cfg["claude_scratch"],
-        scan_seconds=None if args.thorough or args.audit else SCAN_SECONDS,
+        scan_seconds=None if args.thorough or args.audit else scan_seconds,
         caches_only=args.caches_only,
     )
+    if args.dedupe:
+        dedupe_cfg = {**DEFAULTS["dedupe"], **(cfg.get("dedupe") if isinstance(cfg.get("dedupe"), dict) else {})}
+        min_kb = dedupe_cfg["min_kb"]
+        if isinstance(min_kb, bool) or not isinstance(min_kb, (int, float)) or min_kb < 0:
+            p.error("dedupe.min_kb must be a nonnegative number")
+        ok = run_dedupe([Path(r) for r in (args.root or dedupe_cfg["paths"])], int(min_kb * 1024), size_jobs,
+                        dry_run=args.dry_run, yes=args.yes)
+        return 0 if ok else 1
     if args.mem:
         ok = run_mem(ctx, top=args.mem_top or 10, pattern=args.mem_filter or "", by_tree=args.mem_tree,
                      sort=args.mem_sort or "memory", watch=args.mem_watch, full=args.mem_full)
@@ -3469,6 +3748,7 @@ def main() -> int:
     if args.audit:
         run_audit(ctx, to_clean, active, extra)
         for n in notes:
+            console.print()
             console.print(n)
         console.print("\n[dim]audit — no changes made.[/]\n")
         return 0
@@ -3476,41 +3756,55 @@ def main() -> int:
     if not to_clean:
         console.print("\n[bold]No cleanup candidates found in this scan.[/]")
         for n in notes:
+            console.print()
             console.print(n)
         console.print()
         return 0
 
     console.print()
+    if mode_note:
+        console.print(Text.assemble(("Disk is " + level, "red bold" if level == "critical" else "yellow"),
+                                    ("  " + mode_note + " · --gentle opts out", "dim")))
+        console.print()
     console.print((render_table if args.verbose else render_summary)(to_clean, threshold, aggressive))
-    if not args.verbose:
-        console.print(f"[dim]{len(to_clean)} targets · --verbose shows every path · --thorough searches all projects[/]")
-    if not ctx.measure_sizes:
-        console.print("[dim]Sizes not measured — add --sizes for byte counts. Actual freed disk is reported after cleanup.[/]")
     for n in notes:
+        console.print()
         console.print(n)
+    more = ([] if args.verbose else ["--verbose lists every path"]) + (
+        [] if ctx.measure_sizes else ["--sizes measures before cleaning"]) + ["--audit shows where the disk went"]
+    console.print()
+    console.print(Text("  " + " · ".join(more), style="dim"))
 
     if args.dry_run:
         console.print("\n[dim]dry-run — no changes made.[/]\n")
         return 0
 
-    if not args.yes and not Confirm.ask("\n[bold]proceed?[/]", default=False):
+    if not args.yes and not Confirm.ask(f"\n[bold]Clean these {len(to_clean)} targets?[/]", default=False):
         console.print("[yellow]aborted.[/]")
         return 0
 
     free_before = shutil.disk_usage(HOME).free
+    started = time.monotonic()
     console.print()
     result = clean_all(to_clean, clean_jobs, roots, verbose=args.verbose)
-    free_after = shutil.disk_usage(HOME).free
-    freed = max(0, free_after - free_before)
+    usage = shutil.disk_usage(HOME)
+    freed = max(0, usage.free - free_before)
 
     est = sum(i.size or 0 for i in to_clean if not i.ram)
-    estimate = f" [dim](estimated {human_size(est)})[/]" if ctx.measure_sizes else ""
-    body = (f"[bold green]✓ cleaned {result.cleaned}[/]/[bold]{len(to_clean)}[/] item(s)"
-            + (f"  ([yellow]{result.deferred} incomplete/skipped[/])" if result.deferred else "")
-            + (f"  ([red]{result.failed} failed[/])" if result.failed else "")
-            + f"  •  freed [bold green]{human_size(freed)}[/]" + estimate)
-    console.print(Panel(Group(Text.from_markup(body), disk_line(), *health_lines()),
-                        border_style="yellow" if result.failed or result.deferred else "green", box=ROUNDED))
+    head = Text.assemble(("Freed ", "bold"), (human_size(freed), "bold green"),
+                         (f" (estimated {human_size(est)})" if ctx.measure_sizes else "", "dim"),
+                         (f"  in {_elapsed(time.monotonic() - started)} · {result.cleaned} of {len(to_clean)} cleaned", "dim"))
+    if result.deferred:
+        head.append(f" · {result.deferred} incomplete", style="yellow")
+    if result.failed:
+        head.append(f" · {result.failed} failed", style="red")
+    console.print()
+    console.print(head)
+    console.print(health_grid(disk_was=free_before))
+    if usage.total and usage.free < 0.2 * usage.total:
+        console.print(Text.assemble(
+            ("\n  ", ""), (f"{human_size(usage.used)} is still in use.", "yellow"),
+            (" dev-cleaner --audit shows where it sits and what no cleaner covers.", "dim")))
     return 1 if result.failed or result.deferred else 0
 
 

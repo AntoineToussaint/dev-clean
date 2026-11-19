@@ -48,6 +48,15 @@ def test_tilde(monkeypatch):
 
 # --- project discovery -------------------------------------------------------
 
+_real_disk_pressure = dc.disk_pressure
+
+
+@pytest.fixture(autouse=True)
+def roomy_disk(monkeypatch):
+    """Runs must not depend on how full the machine running the tests is."""
+    monkeypatch.setattr(dc, "disk_pressure", lambda path=None: ("ok", 500 * 1024**3, 1000 * 1024**3))
+
+
 def mk(root: Path, *rel: str, files: dict[str, str] | None = None) -> Path:
     d = root.joinpath(*rel)
     d.mkdir(parents=True, exist_ok=True)
@@ -260,7 +269,6 @@ def test_completions_mention_every_group():
 
 def test_group_help_covers_every_group():
     assert set(dc.GROUP_HELP) == set(dc.ALL_GROUPS)
-    assert set(dc.GROUP_EMOJI) == set(dc.ALL_GROUPS)
 
 
 # --- temp sweeps -------------------------------------------------------------
@@ -879,7 +887,7 @@ def test_spinning_processes_are_ours_detached_and_still_burning(monkeypatch):
     c = Console(record=True, width=160)
     c.print(dc.render_summary([item, dc.Item("go", "cache", Path("/c"), 5 * 1024**3)], "1d", False))
     text = c.export_text()
-    assert "🔥 cpu" in text and "0.5 cores" in text and "5.0 GB" in text
+    assert "cpu" in text and "🔥" not in text and "0.5 cores" in text and "5.0 GB" in text
     # by clean time one of them went quiet: only the other is stopped
     monkeypatch.setattr(dc, "list_procs", lambda: [procs[0], replace(procs[1], cpu=0.0)])
     sent, dead = [], set()
@@ -1342,9 +1350,12 @@ def test_default_sizing_skips_active_builds_but_audit_can_measure_them(tmp_path,
 
 def test_skipped_active_sizes_are_labelled_unmeasured():
     item = dc.Item("node", "node_modules/", Path("/p/node_modules"), project=Path("/p"))
-    [note] = dc.render_notes([item], [], "1d", [])
-    assert "sizes skipped; use --audit" in note.plain
-    assert "holding" not in note.plain
+    from rich.console import Console
+    c = Console(record=True, width=120)
+    c.print(*dc.render_notes([item], [], "1d", []))
+    text = c.export_text()
+    assert "sizes skipped; use --audit" in text and "--hours N" in text
+    assert "holding" not in text
 
 
 def test_discovery_reports_progress_without_waiting_for_project_matches(tmp_path):
@@ -1440,6 +1451,19 @@ def test_incomplete_backend_is_skipped_without_blocking_other_groups(monkeypatch
              dc.Item("go", "healthy", mode="action", action=lambda: "done")]
     assert dc.clean_all(items, 2, []) == dc.CleanupReport(cleaned=1, deferred=2)
     assert "skipped after an incomplete cleanup" in dc.console.file.getvalue()
+
+
+def test_partial_sweep_does_not_skip_the_other_sweeps_of_its_group(monkeypatch):
+    from io import StringIO
+    from rich.console import Console
+    monkeypatch.setattr(dc, "console", Console(file=StringIO(), width=120))
+    ran = []
+    def partial():
+        raise dc.CleanupPartial("removed 317, 19 could not be removed")
+    items = [dc.Item("tmp", "idle temp files", mode="action", action=partial),
+             dc.Item("tmp", "idle Claude Code scratch", mode="action", action=lambda: ran.append("scratch"))]
+    assert dc.clean_all(items, 2, []) == dc.CleanupReport(cleaned=1, deferred=1)
+    assert ran == ["scratch"]
 
 
 def test_cleanup_cancellation_does_not_wait_for_command_deadline():
@@ -1729,7 +1753,7 @@ def test_compact_preview_and_cleanup_do_not_dump_paths(tmp_path, monkeypatch):
     output.seek(0); output.truncate()
     monkeypatch.setattr(dc, "_delete", lambda item, roots, cancelled: (item, None, None))
     assert dc.clean_all(items, 4, []).cleaned == 200
-    assert output.getvalue().strip() == "Cleaned: node 200"
+    assert output.getvalue().split() == ["✓", "cleaned", "node", "200"]
 
 
 def test_brew_does_not_repeat_cleanup_walk_without_sizes(monkeypatch):
@@ -1752,7 +1776,7 @@ def test_partial_temp_cleanup_is_incomplete(tmp_path, monkeypatch):
             raise PermissionError("denied")
         real(path)
     monkeypatch.setattr(dc, "force_rmtree", remove)
-    with pytest.raises(dc.CleanupDeferred, match="removed 1, 1 failed"):
+    with pytest.raises(dc.CleanupDeferred, match="removed 1, 1 could not be removed"):
         dc._sweep_action([good, bad], time.time() - 86400)()
     assert not good.exists() and bad.exists()
 
@@ -1791,5 +1815,93 @@ def test_budget_exhaustion_keeps_discovered_candidates_and_reports_partial_scan(
         items = dc.scan_projects(ctx, progress)
     assert len(items) == 1
     assert dc.partition(items, ctx)[0] == []
-    assert any("deeper projects were not scanned" in warning for warning in ctx.warnings)
+    assert any("deeper projects were not seen" in warning for warning in ctx.warnings)
     assert any("incomplete activity checks" in warning for warning in ctx.warnings)
+
+
+@pytest.mark.parametrize("free, setting, argv, expect_aggressive, expect_hours", [
+    (500, '"auto"', [], False, 24),              # roomy: safe tier, configured age
+    (100, '"auto"', [], True, 24),               # tight: dependency caches too
+    (10, '"auto"', [], True, 6),                 # critical: and a shorter idle age
+    (10, '"auto"', ["--hours", "48"], True, 48), # an explicit age is never overridden
+    (10, '"auto"', ["--gentle"], False, 24),
+    (10, "false", [], False, 24),                # pinned off in the config
+    (500, "true", [], True, 24),
+    (500, '"auto"', ["--aggressive"], True, 24),
+])
+def test_tier_follows_free_disk_unless_pinned(tmp_path, monkeypatch, free, setting, argv, expect_aggressive, expect_hours):
+    from io import StringIO
+    from rich.console import Console
+    monkeypatch.setattr(dc, "console", Console(file=StringIO(), width=120))
+    gib = 1024**3
+    level = "critical" if free < 50 else "tight" if free < 150 else "ok"
+    monkeypatch.setattr(dc, "disk_pressure", lambda path=None: (level, free * gib, 1000 * gib))
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f"aggressive = {setting}\n")
+    seen = {}
+    def scan(ctx):
+        seen["aggressive"], seen["hours"] = ctx.aggressive, round((time.time() - ctx.cutoff) / 3600)
+        return []
+    monkeypatch.setattr(dc, "scan_all", scan)
+    monkeypatch.setattr(sys, "argv", ["dev-cleaner", "--config", str(cfg), "--dry-run", *argv])
+    assert dc.main() == 0
+    assert seen == {"aggressive": expect_aggressive, "hours": expect_hours}
+
+
+def test_disk_pressure_levels(monkeypatch):
+    usage = lambda free: SimpleNamespace(total=1000, used=1000 - free, free=free)
+    for free, level in ((500, "ok"), (149, "tight"), (49, "critical")):
+        monkeypatch.setattr(dc.shutil, "disk_usage", lambda path, free=free: usage(free))
+        assert _real_disk_pressure()[0] == level
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="APFS clones")
+def test_dedupe_shares_identical_files_and_keeps_each_ones_metadata(tmp_path, monkeypatch):
+    from io import StringIO
+    from rich.console import Console
+    monkeypatch.setattr(dc, "console", Console(file=StringIO(), width=120))
+    monkeypatch.setattr(dc, "DEDUPE_SETTLE", -60)  # the fixtures were written just now
+    body = os.urandom(64 * 1024)
+    a = mk(tmp_path, "w1", "node_modules", files={})
+    b = mk(tmp_path, "w2", "node_modules", files={})
+    for d in (a, b):
+        (d / "lib.js").write_bytes(body)
+    (b / "other.js").write_bytes(os.urandom(64 * 1024))        # same size, different content
+    (b / "linked.js").write_bytes(body)
+    os.link(b / "linked.js", b / "linked-twin.js")              # hard links are never touched
+    mk(tmp_path, "w2", ".git", files={})
+    (tmp_path / "w2" / ".git" / "pack").write_bytes(body)        # VCS internals neither
+    os.chmod(b / "lib.js", 0o640)
+    os.utime(b / "lib.js", ns=(10**18, 10**18))
+    os.utime(b, ns=(2 * 10**18, 2 * 10**18))
+    other, git_ino, linked_ino = (b / "other.js").read_bytes(), (tmp_path / "w2/.git/pack").stat().st_ino, (b / "linked.js").stat().st_ino
+    inodes = {(a / "lib.js").stat().st_ino, (b / "lib.js").stat().st_ino}
+
+    assert dc.run_dedupe([tmp_path], 16 * 1024, 2, dry_run=True, yes=True)
+    assert {(a / "lib.js").stat().st_ino, (b / "lib.js").stat().st_ino} == inodes  # dry run changes nothing
+
+    assert dc.run_dedupe([tmp_path], 16 * 1024, 2, dry_run=False, yes=True)
+    assert "1 files now share" in dc.console.file.getvalue()
+    assert {(a / "lib.js").stat().st_ino, (b / "lib.js").stat().st_ino} != inodes  # one of the two was replaced
+    for f in (a / "lib.js", b / "lib.js"):
+        assert f.read_bytes() == body
+    st = (b / "lib.js").stat() if (b / "lib.js").stat().st_mtime_ns == 10**18 else None
+    if st is not None:  # w2's copy was the one replaced: its own mode and times survive, and so does its dir's
+        assert st.st_mode & 0o777 == 0o640 and b.stat().st_mtime_ns == 2 * 10**18
+    assert (b / "other.js").read_bytes() == other
+    assert (b / "linked.js").stat().st_ino == linked_ino and (tmp_path / "w2/.git/pack").stat().st_ino == git_ino
+    assert not [f for f in b.iterdir() if f.name.startswith(".dev-cleaner-clone")]
+    # copy-on-write: writing one copy leaves the other intact
+    (a / "lib.js").write_bytes(b"changed")
+    assert (b / "lib.js").read_bytes() == body
+
+
+def test_dedupe_leaves_a_file_that_changed_after_hashing(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.write_bytes(b"x" * 100)
+    b.write_bytes(b"x" * 100)
+    stale = os.lstat(b)
+    b.write_bytes(b"y" * 100)
+    os.utime(b, ns=(1, 1))
+    assert dc._share(str(a), os.lstat(a), str(b), stale) is False
+    assert b.read_bytes() == b"y" * 100

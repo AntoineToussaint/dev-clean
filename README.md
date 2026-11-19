@@ -2,44 +2,29 @@
 
 > One command to sweep the build dirs and caches a dev machine accumulates: stale `target/`, `node_modules`, `.venv`, Go build cache, Docker leftovers, Homebrew downloads, Xcode DerivedData, cargo/npm/uv/pip/gradle caches, and more.
 
-A single-file Python script with a friendly TUI. Useful when your laptop has 9 GB free and `go build` starts failing with *no space left on device*.
+A single-file Python script with a compact terminal report. Useful when your laptop has 9 GB free and `go build` starts failing with *no space left on device*.
 
 ```
 $ dev-cleaner --dry-run --sizes
 
-╭──────────────────────────────────────────────────────────────────────────────╮
-│  🧹  dev-cleaner                                                             │
-│                                                                              │
-│  sweep stale build dirs & dev caches so your disk stops filling up           │
-│  disk: 68.5 GB free of 926.3 GB (93% used)                                   │
-╰──────────────────────────────────────────────────────────────────────────────╯
+dev-cleaner
+  disk    68.5 GB free of 926.3 GB  ━━━━━━━━━━━━━━━━━━━━━━━━  93% used
+  memory  9.1 GB compressed of 48.0 GB · 2.3 GB swapped
+  cpu     load 6.2 on 15 cores
 
-🧹  reclaimable (project dirs idle >1d)
-╭─────┬───────────┬────────┬───────────────────────────────────────────────────╮
-│   # │      size │    age │ what                                              │
-├─────┼───────────┼────────┼───────────────────────────────────────────────────┤
-│     │           │        │ 📦 node  14.7 GB                                  │
-│   1 │    1.0 GB │   6.9d │ ~/dev/saas-starter/frontend  node_modules/        │
-│   2 │  970.3 MB │   7.0d │ ~/dev/saas-starter/frontend  .next/               │
-│   3 │  599.8 MB │      — │ npx cache  ~/.npm/_npx  (throwaway npx installs)  │
-├─────┼───────────┼────────┼───────────────────────────────────────────────────┤
-│     │           │        │ 🍺 brew  6.4 GB                                   │
-│   4 │    6.4 GB │      — │ brew cleanup --prune=all  (old versions, …)       │
-├─────┼───────────┼────────┼───────────────────────────────────────────────────┤
-│     │           │        │ 🐹 go  5.1 GB                                     │
-│   5 │    5.1 GB │      — │ go build cache  ~/Library/Caches/go-build         │
-├─────┼───────────┼────────┼───────────────────────────────────────────────────┤
-│     │           │        │ 🦀 rust  1.9 GB                                   │
-│   6 │    1.3 GB │      — │ cargo registry sources  ~/.cargo/registry/src     │
-│   7 │  671.5 MB │      — │ sccache  ~/Library/Caches/Mozilla.sccache         │
-├─────┼───────────┼────────┼───────────────────────────────────────────────────┤
-│     │           │        │ 🐳 docker  629.4 MB                               │
-│   8 │  629.4 MB │      — │ docker system prune  (stopped containers, …)      │
-├─────┼───────────┼────────┼───────────────────────────────────────────────────┤
-│     │  31.8 GB+ │        │ 56 item(s) — reclaimable                          │
-╰─────┴───────────┴────────┴───────────────────────────────────────────────────╯
-another 47.6 GB in 14 dependency cache(s) / unused image(s) with --aggressive:
-uv cache 21.8 GB, go module cache 17.4 GB, npm cache 2.1 GB, +11 more
+Will clean  56 targets · project builds idle over 1d · frees 31.8 GB+
+  node    41  14.7 GB  node_modules/, .next/, npx cache, pnpm store prune
+  brew     1   6.4 GB  brew cleanup --prune=all
+  go       2   5.1 GB  go build cache, golangci-lint cache
+  rust     7   1.9 GB  target/, cargo registry sources, sccache
+  docker   5  629.4 MB+  docker system prune, docker builder prune -a
+
+Left alone  add the flag to include it
+  --hours N     6 build dir(s) in 6 project(s) edited within 1d holding 3.2 GB
+  --aggressive  47.6 GB in 14 dependency cache(s) / unused image(s): uv cache 21.8 GB,
+                go module cache 17.4 GB, npm cache 2.1 GB, +11 more
+
+  --verbose lists every path · --audit shows where the disk went
 
 dry-run — no changes made.
 ```
@@ -125,9 +110,9 @@ CPU is the average reported by `ps`. “Old / low CPU” counts processes older 
 
 **Silent terminal sessions.** Agents and shells left open in tmux panes or terminal tabs keep their memory, and their language servers', for as long as the terminal exists. `--mem` lists the sessions whose terminal has carried no input or output for a day (or `--days` / `--hours`, or `idle_session_days` when set), in which no process started since and none is using CPU, with the memory each holds including helpers that detached from the terminal. The terminal's own device timestamps are the clock, the one `w` reports as idle time, so a program that prints or is typed at is never silent.
 
-A plain `dev-cleaner` run lists them in its `🧠 memory` row and, once you confirm, hangs each one up the way closing its terminal would: SIGHUP to the programs on the terminal, SIGTERM to their detached helpers, SIGKILL after 8 seconds for whatever ignores both. Every session is re-checked right before: one that printed, ran or started anything since the scan is left alone, as is the terminal dev-cleaner itself runs in and sessions under 64 MB (a bare shell). Preview with `dev-cleaner --only procs --dry-run`. A session holds whatever it has not saved: raise the age with `idle_session_days = 3` under `[procs]`, or set it to `false` to keep every session.
+A plain `dev-cleaner` run lists them in its `memory` row and, once you confirm, hangs each one up the way closing its terminal would: SIGHUP to the programs on the terminal, SIGTERM to their detached helpers, SIGKILL after 8 seconds for whatever ignores both. Every session is re-checked right before: one that printed, ran or started anything since the scan is left alone, as is the terminal dev-cleaner itself runs in and sessions under 64 MB (a bare shell). Preview with `dev-cleaner --only procs --dry-run`. A session holds whatever it has not saved: raise the age with `idle_session_days = 3` under `[procs]`, or set it to `false` to keep every session.
 
-**Spinning processes.** The same run has a `🔥 cpu` row for your own detached programs that have averaged 10% of a core for 6 hours and are still at it: a dev server stuck in a loop, a forgotten test binary. Only executables under your home or a temp dir qualify, never apps, system daemons, package-manager installs, VMs, or anything attached to a terminal. Each is re-checked before it gets SIGTERM (SIGKILL after 8 seconds); one that calmed down is left alone. A long computation you started detached on purpose fits the same description, so read the row before confirming, or set `spinning = false` under `[procs]`.
+**Spinning processes.** The same run has a `cpu` row for your own detached programs that have averaged 10% of a core for 6 hours and are still at it: a dev server stuck in a loop, a forgotten test binary. Only executables under your home or a temp dir qualify, never apps, system daemons, package-manager installs, VMs, or anything attached to a terminal. Each is re-checked before it gets SIGTERM (SIGKILL after 8 seconds); one that calmed down is left alone. A long computation you started detached on purpose fits the same description, so read the row before confirming, or set `spinning = false` under `[procs]`.
 
 ### What is burning my CPU?
 
@@ -174,7 +159,7 @@ Cleanup starts global caches first, then independent project build directories, 
 
 The scan display reserves three fixed rows for projects, tools and sizes. Cleanup reserves fixed worker rows; completed jobs do not remove rows or shift the others. Long paths are clipped to one line in the live display. The preview shows one row per cleaner, and successful cleanup results collapse into counts per cleaner. Failures and incomplete work remain visible. Use `--verbose` for every candidate path and individual cleanup result. Partial temp cleanup is counted as incomplete even when some entries were removed.
 
-External cleanup commands have a 60-second limit. On timeout, dev-cleaner stops the client and its plugins, marks cleanup incomplete, and skips later actions in that group. Other groups continue. A Docker daemon may keep working after its client stops; timeout does not prove that pruning was cancelled or finished. Ctrl-C cancels running command clients too; filesystem deletions already in progress finish before exit.
+External cleanup commands have a 60-second limit. On timeout, dev-cleaner stops the client and its plugins, marks cleanup incomplete, and skips later actions in that group (a sweep that leaves a few entries behind does not hold up the other sweeps). Other groups continue. A Docker daemon may keep working after its client stops; timeout does not prove that pruning was cancelled or finished. Ctrl-C cancels running command clients too; filesystem deletions already in progress finish before exit.
 
 Use `--command-timeout 300` (or `command_timeout = 300` in config) when you deliberately want to wait longer. This limits external cleanup commands, not scanning or filesystem deletion. To leave Docker alone for a run, use `--skip docker`.
 
@@ -182,7 +167,13 @@ Caches written by active builds can report “directory not empty.” Cleanup le
 
 ## What gets cleaned
 
+**Sharing instead of deleting.** `dev-cleaner --dedupe --root PATH` (or `paths` under `[dedupe]`) finds byte-identical files across checkouts, such as the same `node_modules` installed in thirty worktrees, and replaces each duplicate with a copy-on-write clone of one original (APFS, macOS only). Every file keeps its own path, mode and times and can still be edited independently; only the disk blocks are shared. Files under 16 KB (`min_kb`), hard links, symlinks, VCS internals and anything written in the last 10 minutes are left alone. `--dry-run` reports the duplicate bytes found; the real saving is measured from free disk afterwards, because copies that already share blocks free nothing. `du` keeps counting every copy at full size.
+
+**Running processes.** A project whose sources look idle is still kept when a running process has its working directory, executable or a script argument inside it, so a dev server or agent left running in an old checkout keeps its `node_modules`.
+
 Two tiers. **Default** removes things that are pure derived output: rebuilding them costs CPU, not network. **`--aggressive`** adds dependency *download* caches (re-fetched on the next build) and every Docker image not used by a container. The default run always tells you how much more `--aggressive` would free, so nothing is hidden.
+
+The tier follows the disk unless you pin it. With `aggressive = "auto"` (the default), a run on a disk with less than 15% free includes the `--aggressive` tier, and under 5% free it also cuts the idle age to 6 hours unless you passed `--days` or `--hours`. The run says so above the plan. `--gentle`, or `aggressive = false` in the config, keeps the safe tier whatever the disk looks like.
 
 | group | default | `--aggressive` adds |
 |---|---|---|
@@ -249,8 +240,9 @@ ignore = ["archive", "vendored"]
 # Project build dirs are stale after this many idle days.
 days = 1.0
 
-# Also clean dependency download caches (same as --aggressive).
-aggressive = false
+# Dependency download caches and unused docker images: "auto" includes them
+# once under 15% of the disk is free; true always (--aggressive); false never.
+aggressive = "auto"
 
 # Groups to never run. See `dev-cleaner --list`.
 skip = ["brew"]
@@ -350,7 +342,9 @@ dev-cleaner --completion fish > ~/.config/fish/completions/dev-cleaner.fish
 | `--hours N` | | Project idle age in hours (mutually exclusive with `--days`). |
 | `-n`, `--dry-run` | off | List candidates, don't clean. |
 | `-y`, `--yes` | off | Skip the y/N prompt. |
-| `-a`, `--aggressive` | off | Also clean dependency download caches and all unused docker images. |
+| `-a`, `--aggressive` | auto | Also clean dependency download caches and all unused docker images. On by itself once under 15% of the disk is free. |
+| `--dedupe` | off | Share identical files across `--root` dirs via copy-on-write clones. Removes nothing. |
+| `--gentle` | off | Keep dependency caches and the configured idle age even when the disk is tight. |
 | `--only GROUPS` | all | Comma-separated groups to run. |
 | `--skip GROUPS` | | Comma-separated groups to skip (merged with config). |
 | `--audit` | | Show the biggest dirs and how much of each would be freed; change nothing. |
