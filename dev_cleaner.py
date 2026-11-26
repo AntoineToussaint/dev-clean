@@ -386,7 +386,7 @@ _dev_cleaner() {{
     COMPREPLY=()
     cur="${{COMP_WORDS[COMP_CWORD]}}"
     prev="${{COMP_WORDS[COMP_CWORD-1]}}"
-    opts="--root --thorough --caches-only --verbose -v --days --hours --dry-run --yes --plain --json --aggressive --gentle --only --skip --audit --docker-audit --mem --cpu --cpu-sample --top --filter --tree --full --mem-sort --mem-watch --list --dedupe --sizes --size-jobs --clean-jobs --command-timeout --config --init --show-config --completion -n -y -a -h --help"
+    opts="--root --thorough --caches-only --below-free-gib --verbose -v --days --hours --dry-run --yes --plain --json --aggressive --gentle --only --skip --audit --docker-audit --mem --cpu --cpu-sample --top --filter --tree --full --mem-sort --mem-watch --list --dedupe --sizes --size-jobs --clean-jobs --command-timeout --config --init --show-config --completion -n -y -a -h --help"
     case "$prev" in
         --root|--config) COMPREPLY=( $(compgen -f -- "$cur") ); return ;;
         --completion) COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ); return ;;
@@ -428,6 +428,7 @@ _dev_cleaner() {{
         '--mem-watch[Refresh memory and show growth]:seconds:' \
         '--list[List cleaner groups and exit]' \
         '--thorough[Search all projects without a scan budget]' \
+        '--below-free-gib[Only scan when home disk free space is below threshold]:GiB:' \
         '--caches-only[Skip project discovery]' \
         '(-v --verbose)'{{-v,--verbose}}'[Show every path and result]' \
         '--sizes[Measure directory and Docker cache sizes (slower)]' \
@@ -468,6 +469,7 @@ complete -c dev-cleaner -l mem-sort -d "Sort memory tables" -x -a "memory cpu gr
 complete -c dev-cleaner -l mem-watch -d "Refresh memory and show growth" -x
 complete -c dev-cleaner -l list -d "List cleaner groups and exit"
 complete -c dev-cleaner -l thorough -d "Search all projects without a scan budget"
+complete -c dev-cleaner -l below-free-gib -d "Only scan below this much free disk space in GiB" -x
 complete -c dev-cleaner -l caches-only -d "Skip project discovery"
 complete -c dev-cleaner -s v -l verbose -d "Show every path and result"
 complete -c dev-cleaner -l sizes -d "Measure directory and Docker cache sizes (slower)"
@@ -3800,6 +3802,8 @@ def main() -> int:
     )
     p.add_argument("--root", action="append", default=None,
                    help="Where to search for projects (repeatable). Overrides config.")
+    p.add_argument("--below-free-gib", type=int, metavar="GIB",
+                   help="Only run cleanup when the home disk has fewer than this many GiB free")
     scope = p.add_mutually_exclusive_group()
     scope.add_argument("--thorough", action="store_true", help="Search all projects without the normal 10-second scan budget")
     scope.add_argument("--caches-only", action="store_true", help="Skip project discovery; clean global caches and configured temp entries")
@@ -3855,6 +3859,12 @@ def main() -> int:
     p.add_argument("--show-config", action="store_true", help="Print resolved config and exit")
     p.add_argument("--completion", choices=["bash", "zsh", "fish"], help="Print a shell completion script and exit")
     args = p.parse_args()
+    if args.below_free_gib is not None:
+        if args.below_free_gib <= 0:
+            p.error("--below-free-gib requires a positive integer")
+        if any((args.audit, args.docker_audit, args.mem, args.cpu, args.dedupe, args.init,
+                args.show_config, args.list, args.completion)):
+            p.error("--below-free-gib applies only to cleanup runs")
     if args.audit and args.caches_only:
         p.error("--audit cannot be combined with --caches-only")
     if args.json and any((args.audit, args.docker_audit, args.mem, args.cpu, args.dedupe, args.init, args.list,
@@ -4040,7 +4050,13 @@ def main() -> int:
                      sort=args.mem_sort or "memory", watch=args.mem_watch, full=args.mem_full)
         console.print("\n[dim]mem — no changes made.[/]\n")
         return 0 if ok else 1
-    items = scan_all(ctx)
+    skip_for_space = False
+    if args.below_free_gib is not None:
+        if total <= 0:
+            console.print("[red]Could not measure free space on the home disk. Cleanup skipped.[/]")
+            return 1
+        skip_for_space = free >= args.below_free_gib * 1024**3
+    items = [] if skip_for_space else scan_all(ctx)
     to_clean, active, extra = partition(items, ctx)
     notes = render_notes(active, extra, threshold, ctx.warnings)
 
@@ -4057,10 +4073,14 @@ def main() -> int:
         for item in to_clean:
             status, detail = (result.outcomes.get(id(item), ("skipped", None)) if result else ("planned", None))
             targets.append({**item_json(item, now), "status": status, "detail": detail})
-        usage = shutil.disk_usage(HOME)
+        report_free, report_total = free, total
+        if not skip_for_space:
+            usage = shutil.disk_usage(HOME)
+            report_free, report_total = usage.free, usage.total
         print(json.dumps({
             "dry_run": dry_run, "tier": AGGRESSIVE if aggressive else SAFE, "disk_pressure": level,
-            "idle_hours": age_hours, "disk": {"free_bytes": usage.free, "total_bytes": usage.total},
+            "idle_hours": age_hours, "disk": {"free_bytes": report_free, "total_bytes": report_total},
+            **({"skipped_reason": "enough_free_space"} if skip_for_space else {}),
             "targets": targets,
             "left_alone": [{**item_json(i, now), "reason": "needs --aggressive"} for i in extra]
                           + [{**item_json(i, now), "reason": "recently active"} for i in active],
@@ -4072,13 +4092,16 @@ def main() -> int:
 
     interactive = not (args.yes or args.dry_run or args.plain or args.json) and can_interact()
     if not to_clean and not (interactive and extra):
-        console.print("\n[bold]No cleanup candidates found in this scan.[/]")
+        if skip_for_space:
+            console.print(f"Cleanup skipped: {human_size(free)} free, threshold {args.below_free_gib} GiB.")
+        else:
+            console.print("\n[bold]No cleanup candidates found in this scan.[/]")
         for n in notes:
             console.print()
             console.print(n)
         console.print()
         if args.json:
-            emit(dry_run=not args.yes)
+            emit(dry_run=args.dry_run or not args.yes)
         return 0
 
     if interactive:
