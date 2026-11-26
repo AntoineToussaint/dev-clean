@@ -2037,3 +2037,19 @@ def test_health_line_keeps_its_numbers_on_a_narrow_terminal(monkeypatch):
     dc.console.print(dc.health_grid(disk_was=271 * 1024**3))
     disk = next(line for line in dc.console.file.getvalue().splitlines() if "disk" in line)
     assert "…" not in disk and disk.rstrip().endswith("free")
+
+
+@pytest.mark.parametrize("free_gib, should_scan", [(39, True), (40, False), (41, False)])
+def test_free_space_guard(monkeypatch, tmp_path, capsys, free_gib, should_scan):
+    monkeypatch.setattr(dc, "disk_pressure", lambda: ("tight", free_gib * 1024**3, 500 * 1024**3))
+    scans = []
+    monkeypatch.setattr(dc, "scan_all", lambda ctx: scans.append(ctx) or [])
+    monkeypatch.setattr(sys, "argv", ["dev-cleaner", "--config", str(tmp_path / "empty.toml"),
+                                     "--below-free-gib", "40", "--json", "--yes", "--dry-run"])
+    assert dc.main() == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["dry_run"] is True
+    if not should_scan:
+        assert report["disk"]["free_bytes"] == free_gib * 1024**3
+    assert bool(scans) == should_scan
+    assert (report.get("skipped_reason") == "enough_free_space") == (not should_scan)

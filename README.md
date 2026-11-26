@@ -122,6 +122,8 @@ Selected 9 of 12 targets  frees 18.1 GB+ and 2.8 GB RAM
 
 Exit codes: 0 when everything selected was cleaned or nothing needed cleaning, 1 when a cleanup was incomplete or failed, 2 for a usage error or a run that had no way to confirm.
 
+For a recurring Go build-cache cleanup, use `dev-cleaner --below-free-gib 40 --only go --caches-only --gentle --command-timeout 600 --yes`. At or above 40 GiB free on the home disk, it skips discovery and cleanup. Below that threshold it selects the Go build and Go tool caches and keeps downloaded modules. The threshold controls when a run starts. Replace `--yes` with `--dry-run` to preview it.
+
 ### Where did my disk go?
 
 `--audit` measures your home dir (and the temp dirs) with `du`, shows every dir over 1 GB down to where the bulk sits, and puts next to each one what a default run and an `--aggressive` run would free there. Anything marked **not covered** is space dev-cleaner can't see: either a project tree outside your `roots`, or a disposable dir of some tool you can declare under `[[extra]]`. It changes nothing. The dirs two levels down are each measured by their own `du`, `--size-jobs` at a time, with a running count of dirs done and bytes found; on a full disk it still takes minutes. A dir whose measurement fails is named under the table instead of silently missing from it.
@@ -373,6 +375,7 @@ dev-cleaner --completion fish > ~/.config/fish/completions/dev-cleaner.fish
 |---|---|---|
 | `--root PATH` | `~` | Repeatable. Overrides config. |
 | `--thorough` | off | Remove the normal 10-second discovery budget. Implied by `--audit`. |
+| `--below-free-gib GIB` | off | Skip cleanup at or above this much free space on the home disk. |
 | `--caches-only` | off | Skip project discovery; keep global caches and configured temp cleanup. |
 | `-v`, `--verbose` | off | Show every candidate path and individual cleanup result. |
 | `--days N` | `1.0` | Project idle age in days. |
