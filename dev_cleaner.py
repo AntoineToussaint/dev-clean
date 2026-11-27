@@ -4050,13 +4050,13 @@ def main() -> int:
                      sort=args.mem_sort or "memory", watch=args.mem_watch, full=args.mem_full)
         console.print("\n[dim]mem — no changes made.[/]\n")
         return 0 if ok else 1
-    skip_for_space = False
+    skipped_reason = None
     if args.below_free_gib is not None:
         if total <= 0:
-            console.print("[red]Could not measure free space on the home disk. Cleanup skipped.[/]")
-            return 1
-        skip_for_space = free >= args.below_free_gib * 1024**3
-    items = [] if skip_for_space else scan_all(ctx)
+            skipped_reason = "disk_unmeasurable"
+        elif free >= args.below_free_gib * 1024**3:
+            skipped_reason = "enough_free_space"
+    items = [] if skipped_reason else scan_all(ctx)
     to_clean, active, extra = partition(items, ctx)
     notes = render_notes(active, extra, threshold, ctx.warnings)
 
@@ -4074,13 +4074,13 @@ def main() -> int:
             status, detail = (result.outcomes.get(id(item), ("skipped", None)) if result else ("planned", None))
             targets.append({**item_json(item, now), "status": status, "detail": detail})
         report_free, report_total = free, total
-        if not skip_for_space:
+        if not skipped_reason:
             usage = shutil.disk_usage(HOME)
             report_free, report_total = usage.free, usage.total
         print(json.dumps({
             "dry_run": dry_run, "tier": AGGRESSIVE if aggressive else SAFE, "disk_pressure": level,
             "idle_hours": age_hours, "disk": {"free_bytes": report_free, "total_bytes": report_total},
-            **({"skipped_reason": "enough_free_space"} if skip_for_space else {}),
+            **({"skipped_reason": skipped_reason} if skipped_reason else {}),
             "targets": targets,
             "left_alone": [{**item_json(i, now), "reason": "needs --aggressive"} for i in extra]
                           + [{**item_json(i, now), "reason": "recently active"} for i in active],
@@ -4092,7 +4092,9 @@ def main() -> int:
 
     interactive = not (args.yes or args.dry_run or args.plain or args.json) and can_interact()
     if not to_clean and not (interactive and extra):
-        if skip_for_space:
+        if skipped_reason == "disk_unmeasurable":
+            console.print("[red]Could not measure free space on the home disk. Cleanup skipped.[/]")
+        elif skipped_reason:
             console.print(f"Cleanup skipped: {human_size(free)} free, threshold {args.below_free_gib} GiB.")
         else:
             console.print("\n[bold]No cleanup candidates found in this scan.[/]")
@@ -4102,7 +4104,7 @@ def main() -> int:
         console.print()
         if args.json:
             emit(dry_run=args.dry_run or not args.yes)
-        return 0
+        return 1 if skipped_reason == "disk_unmeasurable" else 0
 
     if interactive:
         def measure() -> None:

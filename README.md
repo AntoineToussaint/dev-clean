@@ -122,7 +122,7 @@ Selected 9 of 12 targets  frees 18.1 GB+ and 2.8 GB RAM
 
 Exit codes: 0 when everything selected was cleaned or nothing needed cleaning, 1 when a cleanup was incomplete or failed, 2 for a usage error or a run that had no way to confirm.
 
-For a recurring Go build-cache cleanup, use `dev-cleaner --below-free-gib 40 --only go --caches-only --gentle --command-timeout 600 --yes`. At or above 40 GiB free on the home disk, it skips discovery and cleanup. Below that threshold it selects the Go build and Go tool caches and keeps downloaded modules. The threshold controls when a run starts. Replace `--yes` with `--dry-run` to preview it.
+For a recurring Go build-cache cleanup, use `dev-cleaner --below-free-gib 40 --only go --caches-only --gentle --command-timeout 600 --yes`. At or above 40 GiB free on the home disk, it skips discovery and cleanup. Below that threshold it selects the Go build and Go tool caches and keeps downloaded modules. If the home disk cannot be measured, the cleaner skips discovery and exits with status 1. With `--json`, stdout carries the usual report with `skipped_reason` set to `disk_unmeasurable`. Replace `--yes` with `--dry-run` to preview it.
 
 ### Where did my disk go?
 
