@@ -2053,3 +2053,25 @@ def test_free_space_guard(monkeypatch, tmp_path, capsys, free_gib, should_scan):
         assert report["disk"]["free_bytes"] == free_gib * 1024**3
     assert bool(scans) == should_scan
     assert (report.get("skipped_reason") == "enough_free_space") == (not should_scan)
+
+
+def test_free_space_guard_measurement_error(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(dc, "disk_pressure", lambda: ("ok", 0, 0))
+    monkeypatch.setattr(dc, "scan_all", lambda ctx: pytest.fail("scanned without a measurement"))
+    monkeypatch.setattr(sys, "argv", ["dev-cleaner", "--config", str(tmp_path / "empty.toml"),
+                                     "--below-free-gib", "40", "--json", "--yes"])
+    assert dc.main() == 1
+    output = capsys.readouterr()
+    report = json.loads(output.out)
+    assert report["skipped_reason"] == "disk_unmeasurable"
+    assert report["targets"] == [] and report["result"] is None
+    assert "Could not measure free space" in output.err
+
+
+def test_free_space_guard_plain_message(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(dc, "console", dc.Console(file=sys.stdout))
+    monkeypatch.setattr(dc, "disk_pressure", lambda: ("ok", 41 * 1024**3, 500 * 1024**3))
+    monkeypatch.setattr(sys, "argv", ["dev-cleaner", "--config", str(tmp_path / "empty.toml"),
+                                     "--below-free-gib", "40", "--plain"])
+    assert dc.main() == 0
+    assert "Cleanup skipped: 41.0 GB free, threshold 40 GiB." in capsys.readouterr().out
